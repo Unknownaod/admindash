@@ -7,6 +7,10 @@ export const runtime = "nodejs";
 const SESSION_COOKIE = "fades_admin_session";
 const SESSION_MAX_AGE = 60 * 60 * 24 * 7; // 7 days
 
+// ============================================================
+// RESPONSE HELPERS
+// ============================================================
+
 function json(data, status = 200) {
   return Response.json(data, {
     status,
@@ -15,6 +19,10 @@ function json(data, status = 200) {
     },
   });
 }
+
+// ============================================================
+// ENVIRONMENT
+// ============================================================
 
 function getAdminCode() {
   return process.env.ADMIN_CODE || "";
@@ -27,6 +35,10 @@ function getSessionSecret() {
     ""
   );
 }
+
+// ============================================================
+// BASE64URL
+// ============================================================
 
 function base64url(buffer) {
   return Buffer.from(buffer)
@@ -43,15 +55,24 @@ function fromBase64url(value) {
   );
 }
 
+// ============================================================
+// SESSION
+// ============================================================
+
 function createSessionToken() {
   const secret = getSessionSecret();
 
   if (!secret) {
-    throw new Error("ADMIN_SESSION_SECRET is not configured.");
+    throw new Error(
+      "ADMIN_SESSION_SECRET is not configured."
+    );
   }
 
   const timestamp = Date.now().toString();
-  const random = crypto.randomBytes(32).toString("hex");
+
+  const random = crypto
+    .randomBytes(32)
+    .toString("hex");
 
   const payload = `${timestamp}.${random}`;
 
@@ -60,7 +81,9 @@ function createSessionToken() {
     .update(payload)
     .digest();
 
-  return `${base64url(Buffer.from(payload))}.${base64url(signature)}`;
+  return `${base64url(
+    Buffer.from(payload)
+  )}.${base64url(signature)}`;
 }
 
 function verifySessionToken(token) {
@@ -75,8 +98,12 @@ function verifySessionToken(token) {
       return false;
     }
 
-    const payload = fromBase64url(parts[0]).toString();
-    const suppliedSignature = fromBase64url(parts[1]);
+    const payload = fromBase64url(
+      parts[0]
+    ).toString();
+
+    const suppliedSignature =
+      fromBase64url(parts[1]);
 
     const secret = getSessionSecret();
 
@@ -90,7 +117,8 @@ function verifySessionToken(token) {
       .digest();
 
     if (
-      suppliedSignature.length !== expectedSignature.length
+      suppliedSignature.length !==
+      expectedSignature.length
     ) {
       return false;
     }
@@ -104,7 +132,8 @@ function verifySessionToken(token) {
       return false;
     }
 
-    const [timestamp] = payload.split(".");
+    const [timestamp] =
+      payload.split(".");
 
     const createdAt = Number(timestamp);
 
@@ -112,9 +141,13 @@ function verifySessionToken(token) {
       return false;
     }
 
-    const age = Date.now() - createdAt;
+    const age =
+      Date.now() - createdAt;
 
-    if (age < 0 || age > SESSION_MAX_AGE * 1000) {
+    if (
+      age < 0 ||
+      age > SESSION_MAX_AGE * 1000
+    ) {
       return false;
     }
 
@@ -134,6 +167,10 @@ async function isAdmin() {
   return verifySessionToken(token);
 }
 
+// ============================================================
+// INVITE HELPERS
+// ============================================================
+
 function normalizeCode(code) {
   return String(code || "")
     .trim()
@@ -150,9 +187,10 @@ function generateInviteCode() {
     let output = "";
 
     for (let i = 0; i < 4; i++) {
-      output += alphabet[
-        bytes[i] % alphabet.length
-      ];
+      output +=
+        alphabet[
+          bytes[i] % alphabet.length
+        ];
     }
 
     return output;
@@ -179,14 +217,41 @@ function parseExpiration(value) {
   return date.toISOString();
 }
 
+function calculateStatus(invite) {
+  if (invite.status === "revoked") {
+    return "revoked";
+  }
+
+  if (invite.status === "used") {
+    return "used";
+  }
+
+  if (
+    invite.expires_at &&
+    new Date(invite.expires_at).getTime() <=
+      Date.now()
+  ) {
+    return "expired";
+  }
+
+  return "active";
+}
+
+// ============================================================
+// LOGIN
+// ============================================================
+
 async function handleLogin(request) {
-  const body = await request.json().catch(() => ({}));
+  const body = await request
+    .json()
+    .catch(() => ({}));
 
   const suppliedCode = String(
     body.code || ""
   );
 
-  const configuredCode = getAdminCode();
+  const configuredCode =
+    getAdminCode();
 
   if (!configuredCode) {
     return json(
@@ -199,13 +264,11 @@ async function handleLogin(request) {
     );
   }
 
-  const suppliedBuffer = Buffer.from(
-    suppliedCode
-  );
+  const suppliedBuffer =
+    Buffer.from(suppliedCode);
 
-  const configuredBuffer = Buffer.from(
-    configuredCode
-  );
+  const configuredBuffer =
+    Buffer.from(configuredCode);
 
   const validLength =
     suppliedBuffer.length ===
@@ -224,22 +287,27 @@ async function handleLogin(request) {
     return json(
       {
         success: false,
-        error: "Invalid administrator code.",
+        error:
+          "Invalid administrator code.",
       },
       401
     );
   }
 
-  const token = createSessionToken();
+  const token =
+    createSessionToken();
 
-  const cookieStore = await cookies();
+  const cookieStore =
+    await cookies();
 
   cookieStore.set(
     SESSION_COOKIE,
     token,
     {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure:
+        process.env.NODE_ENV ===
+        "production",
       sameSite: "strict",
       path: "/",
       maxAge: SESSION_MAX_AGE,
@@ -251,15 +319,22 @@ async function handleLogin(request) {
   });
 }
 
+// ============================================================
+// LOGOUT
+// ============================================================
+
 async function handleLogout() {
-  const cookieStore = await cookies();
+  const cookieStore =
+    await cookies();
 
   cookieStore.set(
     SESSION_COOKIE,
     "",
     {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure:
+        process.env.NODE_ENV ===
+        "production",
       sameSite: "strict",
       path: "/",
       maxAge: 0,
@@ -271,13 +346,24 @@ async function handleLogout() {
   });
 }
 
+// ============================================================
+// SESSION
+// ============================================================
+
 async function handleSession() {
   return json({
-    authenticated: await isAdmin(),
+    authenticated:
+      await isAdmin(),
   });
 }
 
-async function handleCreateInvite(request) {
+// ============================================================
+// CREATE INVITE
+// ============================================================
+
+async function handleCreateInvite(
+  request
+) {
   if (!(await isAdmin())) {
     return json(
       {
@@ -288,15 +374,20 @@ async function handleCreateInvite(request) {
     );
   }
 
-  const body = await request.json().catch(() => ({}));
+  const body = await request
+    .json()
+    .catch(() => ({}));
 
   const requestedExpiration =
-    parseExpiration(body.expiresAt);
+    parseExpiration(
+      body.expiresAt
+    );
 
   if (
     requestedExpiration &&
-    new Date(requestedExpiration).getTime() <=
-      Date.now()
+    new Date(
+      requestedExpiration
+    ).getTime() <= Date.now()
   ) {
     return json(
       {
@@ -308,9 +399,16 @@ async function handleCreateInvite(request) {
     );
   }
 
-  let code = generateInviteCode();
+  let code =
+    generateInviteCode();
 
-  for (let attempt = 0; attempt < 10; attempt++) {
+  // Make sure the generated code
+  // isn't already in the database.
+  for (
+    let attempt = 0;
+    attempt < 10;
+    attempt++
+  ) {
     const existing = await sql`
       SELECT id
       FROM invites
@@ -318,14 +416,17 @@ async function handleCreateInvite(request) {
       LIMIT 1
     `;
 
-    if (existing.rows.length === 0) {
+    // Neon returns an array directly.
+    if (existing.length === 0) {
       break;
     }
 
-    code = generateInviteCode();
+    code =
+      generateInviteCode();
   }
 
-  const id = generateId();
+  const id =
+    generateId();
 
   await sql`
     INSERT INTO invites (
@@ -348,30 +449,15 @@ async function handleCreateInvite(request) {
       id,
       code,
       status: "active",
-      expiresAt: requestedExpiration,
+      expiresAt:
+        requestedExpiration,
     },
   });
 }
 
-function calculateStatus(invite) {
-  if (invite.status === "revoked") {
-    return "revoked";
-  }
-
-  if (invite.status === "used") {
-    return "used";
-  }
-
-  if (
-    invite.expires_at &&
-    new Date(invite.expires_at).getTime() <=
-      Date.now()
-  ) {
-    return "expired";
-  }
-
-  return "active";
-}
+// ============================================================
+// LIST INVITES
+// ============================================================
 
 async function handleListInvites() {
   if (!(await isAdmin())) {
@@ -397,15 +483,22 @@ async function handleListInvites() {
     ORDER BY created_at DESC
   `;
 
-  const invites = result.rows.map((invite) => ({
-    id: invite.id,
-    code: invite.code,
-    status: calculateStatus(invite),
-    createdAt: invite.created_at,
-    usedAt: invite.used_at,
-    revokedAt: invite.revoked_at,
-    expiresAt: invite.expires_at,
-  }));
+  // Neon returns the rows directly.
+  const invites =
+    result.map((invite) => ({
+      id: invite.id,
+      code: invite.code,
+      status:
+        calculateStatus(invite),
+      createdAt:
+        invite.created_at,
+      usedAt:
+        invite.used_at,
+      revokedAt:
+        invite.revoked_at,
+      expiresAt:
+        invite.expires_at,
+    }));
 
   return json({
     success: true,
@@ -413,13 +506,20 @@ async function handleListInvites() {
   });
 }
 
-async function handleValidateInvite(request) {
+// ============================================================
+// VALIDATE INVITE
+// ============================================================
+
+async function handleValidateInvite(
+  request
+) {
   const { searchParams } =
     new URL(request.url);
 
-  const code = normalizeCode(
-    searchParams.get("code")
-  );
+  const code =
+    normalizeCode(
+      searchParams.get("code")
+    );
 
   if (!code) {
     return json({
@@ -437,15 +537,20 @@ async function handleValidateInvite(request) {
     LIMIT 1
   `;
 
-  if (result.rows.length === 0) {
+  // Neon returns an array.
+  if (result.length === 0) {
     return json({
       valid: false,
     });
   }
 
-  const invite = result.rows[0];
+  const invite =
+    result[0];
 
-  if (invite.status !== "active") {
+  if (
+    invite.status !==
+    "active"
+  ) {
     return json({
       valid: false,
     });
@@ -453,8 +558,9 @@ async function handleValidateInvite(request) {
 
   if (
     invite.expires_at &&
-    new Date(invite.expires_at).getTime() <=
-      Date.now()
+    new Date(
+      invite.expires_at
+    ).getTime() <= Date.now()
   ) {
     return json({
       valid: false,
@@ -466,29 +572,40 @@ async function handleValidateInvite(request) {
   });
 }
 
-async function handleRedeemInvite(request) {
-  const body = await request.json().catch(() => ({}));
+// ============================================================
+// REDEEM INVITE
+// ============================================================
 
-  const code = normalizeCode(body.code);
+async function handleRedeemInvite(
+  request
+) {
+  const body = await request
+    .json()
+    .catch(() => ({}));
+
+  const code =
+    normalizeCode(body.code);
 
   if (!code) {
     return json(
       {
         success: false,
-        error: "Invite code is required.",
+        error:
+          "Invite code is required.",
       },
       400
     );
   }
 
   /*
-   * Atomic redemption:
+   * Atomic redemption.
    *
-   * Only an active, non-expired invite
-   * can be changed to used.
+   * Only an active and non-expired
+   * invite can become used.
    *
-   * This prevents two signup requests
-   * from successfully using the same invite.
+   * This prevents two signup
+   * requests from consuming the
+   * same invite.
    */
 
   const result = await sql`
@@ -510,7 +627,8 @@ async function handleRedeemInvite(request) {
       used_at
   `;
 
-  if (result.rows.length === 0) {
+  // Neon returns an array.
+  if (result.length === 0) {
     return json(
       {
         success: false,
@@ -521,18 +639,27 @@ async function handleRedeemInvite(request) {
     );
   }
 
+  const invite =
+    result[0];
+
   return json({
     success: true,
     invite: {
-      id: result.rows[0].id,
-      code: result.rows[0].code,
-      status: result.rows[0].status,
-      usedAt: result.rows[0].used_at,
+      id: invite.id,
+      code: invite.code,
+      status: invite.status,
+      usedAt: invite.used_at,
     },
   });
 }
 
-async function handleRevokeInvite(request) {
+// ============================================================
+// REVOKE INVITE
+// ============================================================
+
+async function handleRevokeInvite(
+  request
+) {
   if (!(await isAdmin())) {
     return json(
       {
@@ -546,15 +673,17 @@ async function handleRevokeInvite(request) {
   const { searchParams } =
     new URL(request.url);
 
-  const code = normalizeCode(
-    searchParams.get("code")
-  );
+  const code =
+    normalizeCode(
+      searchParams.get("code")
+    );
 
   if (!code) {
     return json(
       {
         success: false,
-        error: "Invite code is required.",
+        error:
+          "Invite code is required.",
       },
       400
     );
@@ -575,7 +704,8 @@ async function handleRevokeInvite(request) {
       revoked_at
   `;
 
-  if (result.rows.length === 0) {
+  // Neon returns an array.
+  if (result.length === 0) {
     return json(
       {
         success: false,
@@ -591,6 +721,10 @@ async function handleRevokeInvite(request) {
   });
 }
 
+// ============================================================
+// STATS
+// ============================================================
+
 async function handleStats() {
   if (!(await isAdmin())) {
     return json(
@@ -605,38 +739,62 @@ async function handleStats() {
   const result = await sql`
     SELECT
       COUNT(*)::int AS total,
+
       COUNT(*) FILTER (
-        WHERE status = 'active'
-        AND (
-          expires_at IS NULL
-          OR expires_at > NOW()
-        )
+        WHERE
+          status = 'active'
+          AND (
+            expires_at IS NULL
+            OR expires_at > NOW()
+          )
       )::int AS active,
+
       COUNT(*) FILTER (
         WHERE status = 'used'
       )::int AS used,
+
       COUNT(*) FILTER (
         WHERE status = 'revoked'
       )::int AS revoked,
+
       COUNT(*) FILTER (
-        WHERE status = 'active'
-        AND expires_at IS NOT NULL
-        AND expires_at <= NOW()
+        WHERE
+          status = 'active'
+          AND expires_at IS NOT NULL
+          AND expires_at <= NOW()
       )::int AS expired
+
     FROM invites
   `;
+
+  // Neon returns an array.
+  const stats =
+    result[0];
 
   return json({
     success: true,
     stats: {
-      total: result.rows[0].total,
-      active: result.rows[0].active,
-      used: result.rows[0].used,
-      revoked: result.rows[0].revoked,
-      expired: result.rows[0].expired,
+      total:
+        Number(stats.total) || 0,
+
+      active:
+        Number(stats.active) || 0,
+
+      used:
+        Number(stats.used) || 0,
+
+      revoked:
+        Number(stats.revoked) || 0,
+
+      expired:
+        Number(stats.expired) || 0,
     },
   });
 }
+
+// ============================================================
+// GET
+// ============================================================
 
 export async function GET(request) {
   try {
@@ -657,7 +815,9 @@ export async function GET(request) {
         return handleListInvites();
 
       case "validate":
-        return handleValidateInvite(request);
+        return handleValidateInvite(
+          request
+        );
 
       case "stats":
         return handleStats();
@@ -666,7 +826,8 @@ export async function GET(request) {
         return json(
           {
             success: false,
-            error: "Unknown action.",
+            error:
+              "Unknown action.",
           },
           400
         );
@@ -680,50 +841,76 @@ export async function GET(request) {
     return json(
       {
         success: false,
-        error: "Internal server error.",
+        error:
+          "Internal server error.",
+        details:
+          process.env.NODE_ENV !==
+          "production"
+            ? String(
+                error?.message ||
+                  error
+              )
+            : undefined,
       },
       500
     );
   }
 }
 
+// ============================================================
+// POST
+// ============================================================
+
 export async function POST(request) {
   try {
     await initializeDatabase();
 
-    const url = new URL(request.url);
+    const url =
+      new URL(request.url);
 
     let action =
-      url.searchParams.get("action");
+      url.searchParams.get(
+        "action"
+      );
 
     if (!action) {
-      const clone = request.clone();
+      const clone =
+        request.clone();
 
-      const body = await clone
-        .json()
-        .catch(() => ({}));
+      const body =
+        await clone
+          .json()
+          .catch(() => ({}));
 
-      action = body.action;
+      action =
+        body.action;
     }
 
     switch (action) {
       case "login":
-        return handleLogin(request);
+        return handleLogin(
+          request
+        );
 
       case "logout":
         return handleLogout();
 
       case "create_invite":
-        return handleCreateInvite(request);
+        return handleCreateInvite(
+          request
+        );
 
       case "redeem":
-        return handleRedeemInvite(request);
+        return handleRedeemInvite(
+          request
+        );
 
       default:
         return json(
           {
             success: false,
-            error: "Unknown action.",
+            error:
+              "Unknown action.",
           },
           400
         );
@@ -737,12 +924,25 @@ export async function POST(request) {
     return json(
       {
         success: false,
-        error: "Internal server error.",
+        error:
+          "Internal server error.",
+        details:
+          process.env.NODE_ENV !==
+          "production"
+            ? String(
+                error?.message ||
+                  error
+              )
+            : undefined,
       },
       500
     );
   }
 }
+
+// ============================================================
+// DELETE
+// ============================================================
 
 export async function DELETE(request) {
   try {
@@ -752,19 +952,24 @@ export async function DELETE(request) {
       new URL(request.url);
 
     const action =
-      searchParams.get("action");
+      searchParams.get(
+        "action"
+      );
 
     if (action !== "revoke") {
       return json(
         {
           success: false,
-          error: "Unknown action.",
+          error:
+            "Unknown action.",
         },
         400
       );
     }
 
-    return handleRevokeInvite(request);
+    return handleRevokeInvite(
+      request
+    );
   } catch (error) {
     console.error(
       "Fades Admin DELETE error:",
@@ -774,7 +979,16 @@ export async function DELETE(request) {
     return json(
       {
         success: false,
-        error: "Internal server error.",
+        error:
+          "Internal server error.",
+        details:
+          process.env.NODE_ENV !==
+          "production"
+            ? String(
+                error?.message ||
+                  error
+              )
+            : undefined,
       },
       500
     );
