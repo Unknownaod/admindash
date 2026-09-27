@@ -11,6 +11,308 @@ const MIN_INVITE_USES = 1;
 const MAX_INVITE_USES = 100000;
 
 // ============================================================
+// RATE LIMITING
+// ============================================================
+//
+// These limits are intentionally kept in memory.
+//
+// IMPORTANT:
+// - This protects the route from basic abuse/brute-force attacks.
+// - It does NOT require database changes.
+// - On serverless/multi-instance deployments, each instance has
+//   its own limiter. For stronger distributed protection, use
+//   Cloudflare/WAF or Redis later.
+//
+// Limits:
+//
+// LOGIN
+//   5 attempts / 15 minutes per IP
+//
+// VALIDATE
+//   60 requests / minute per IP
+//
+// REDEEM
+//   10 requests / 10 minutes per IP
+//
+// ADMIN ACTIONS
+//   120 requests / minute per IP
+//
+// GLOBAL
+//   300 requests / minute per IP
+//
+// ============================================================
+
+const RATE_LIMITS = {
+  global: {
+    max: 300,
+    windowMs: 60 * 1000,
+  },
+
+  login: {
+    max: 5,
+    windowMs: 15 * 60 * 1000,
+  },
+
+  validate: {
+    max: 60,
+    windowMs: 60 * 1000,
+  },
+
+  redeem: {
+    max: 10,
+    windowMs: 10 * 60 * 1000,
+  },
+
+  admin: {
+    max: 120,
+    windowMs: 60 * 1000,
+  },
+};
+
+const rateLimitStore = new Map();
+
+let lastRateLimitCleanup = Date.now();
+
+const RATE_LIMIT_CLEANUP_INTERVAL =
+  5 * 60 * 1000;
+
+// ============================================================
+// RATE LIMIT HELPERS
+// ============================================================
+
+function getClientIp(request) {
+  /*
+   * Prefer the platform-provided forwarded IP.
+   *
+   * We intentionally only use the first IP when multiple
+   * addresses are supplied.
+   */
+
+  const forwardedFor =
+    request.headers.get(
+      "x-forwarded-for"
+    );
+
+  if (forwardedFor) {
+    const firstIp =
+      forwardedFor
+        .split(",")[0]
+        .trim();
+
+    if (firstIp) {
+      return firstIp;
+    }
+  }
+
+  const realIp =
+    request.headers.get(
+      "x-real-ip"
+    );
+
+  if (realIp) {
+    return realIp.trim();
+  }
+
+  /*
+   * If the platform does not expose an IP,
+   * use a safe fallback key.
+   */
+
+  return "unknown";
+}
+
+function cleanupRateLimits() {
+  const now = Date.now();
+
+  if (
+    now - lastRateLimitCleanup <
+    RATE_LIMIT_CLEANUP_INTERVAL
+  ) {
+    return;
+  }
+
+  lastRateLimitCleanup = now;
+
+  for (
+    const [
+      key,
+      entry,
+    ] of rateLimitStore.entries()
+  ) {
+    if (
+      !entry ||
+      entry.resetAt <= now
+    ) {
+      rateLimitStore.delete(key);
+    }
+  }
+}
+
+function checkRateLimit(
+  request,
+  type
+) {
+  cleanupRateLimits();
+
+  const config =
+    RATE_LIMITS[type];
+
+  if (!config) {
+    return {
+      allowed: true,
+      remaining: Infinity,
+      retryAfter: 0,
+    };
+  }
+
+  const ip =
+    getClientIp(request);
+
+  const now = Date.now();
+
+  const key =
+    `${type}:${ip}`;
+
+  let entry =
+    rateLimitStore.get(key);
+
+  /*
+   * Start a new window.
+   */
+
+  if (
+    !entry ||
+    entry.resetAt <= now
+  ) {
+    entry = {
+      count: 0,
+      resetAt:
+        now + config.windowMs,
+    };
+
+    rateLimitStore.set(
+      key,
+      entry
+    );
+  }
+
+  entry.count += 1;
+
+  const remaining =
+    Math.max(
+      0,
+      config.max -
+        entry.count
+    );
+
+  if (
+    entry.count >
+    config.max
+  ) {
+    const retryAfter =
+      Math.max(
+        1,
+        Math.ceil(
+          (entry.resetAt -
+            now) /
+            1000
+        )
+      );
+
+    return {
+      allowed: false,
+      remaining: 0,
+      retryAfter,
+      limit: config.max,
+      resetAt:
+        entry.resetAt,
+    };
+  }
+
+  return {
+    allowed: true,
+    remaining,
+    retryAfter: 0,
+    limit: config.max,
+    resetAt:
+      entry.resetAt,
+  };
+}
+
+function rateLimitResponse(
+  result
+) {
+  const response =
+    json(
+      {
+        success: false,
+        error:
+          "Too many requests. Please try again later.",
+        retryAfter:
+          result.retryAfter,
+      },
+      429
+    );
+
+  /*
+   * Add Retry-After so browsers and clients know
+   * when they can try again.
+   */
+
+  response.headers.set(
+    "Retry-After",
+    String(
+      result.retryAfter
+    )
+  );
+
+  response.headers.set(
+    "X-RateLimit-Limit",
+    String(
+      result.limit
+    )
+  );
+
+  response.headers.set(
+    "X-RateLimit-Remaining",
+    "0"
+  );
+
+  return response;
+}
+
+function applyRateLimit(
+  request,
+  type
+) {
+  /*
+   * Global limiter first.
+   */
+
+  const global =
+    checkRateLimit(
+      request,
+      "global"
+    );
+
+  if (!global.allowed) {
+    return global;
+  }
+
+  /*
+   * Action-specific limiter.
+   */
+
+  const specific =
+    checkRateLimit(
+      request,
+      type
+    );
+
+  return specific;
+}
+
+// ============================================================
 // CORS
 // ============================================================
 
@@ -19,12 +321,26 @@ const ALLOWED_ORIGINS = new Set([
   "https://www.mail.fades.lol",
 ]);
 
-function applyCors(response, request) {
-  const origin = request.headers.get("origin");
+function applyCors(
+  response,
+  request
+) {
+  const origin =
+    request.headers.get(
+      "origin"
+    );
 
-  const headers = new Headers(response.headers);
+  const headers =
+    new Headers(
+      response.headers
+    );
 
-  if (origin && ALLOWED_ORIGINS.has(origin)) {
+  if (
+    origin &&
+    ALLOWED_ORIGINS.has(
+      origin
+    )
+  ) {
     headers.set(
       "Access-Control-Allow-Origin",
       origin
@@ -61,24 +377,38 @@ function applyCors(response, request) {
     "no-store"
   );
 
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
+  return new Response(
+    response.body,
+    {
+      status:
+        response.status,
+
+      statusText:
+        response.statusText,
+
+      headers,
+    }
+  );
 }
 
 // ============================================================
 // RESPONSE HELPERS
 // ============================================================
 
-function json(data, status = 200) {
-  return Response.json(data, {
-    status,
-    headers: {
-      "Cache-Control": "no-store",
-    },
-  });
+function json(
+  data,
+  status = 200
+) {
+  return Response.json(
+    data,
+    {
+      status,
+      headers: {
+        "Cache-Control":
+          "no-store",
+      },
+    }
+  );
 }
 
 // ============================================================
@@ -86,7 +416,10 @@ function json(data, status = 200) {
 // ============================================================
 
 function getAdminCode() {
-  return process.env.ADMIN_CODE || "";
+  return (
+    process.env.ADMIN_CODE ||
+    ""
+  );
 }
 
 function getSessionSecret() {
@@ -101,19 +434,38 @@ function getSessionSecret() {
 // BASE64URL
 // ============================================================
 
-function base64url(buffer) {
+function base64url(
+  buffer
+) {
   return Buffer.from(buffer)
     .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=/g, "");
+    .replace(
+      /\+/g,
+      "-"
+    )
+    .replace(
+      /\//g,
+      "_"
+    )
+    .replace(
+      /=/g,
+      ""
+    );
 }
 
-function fromBase64url(value) {
+function fromBase64url(
+  value
+) {
   return Buffer.from(
     value
-      .replace(/-/g, "+")
-      .replace(/_/g, "/"),
+      .replace(
+        /-/g,
+        "+"
+      )
+      .replace(
+        /_/g,
+        "/"
+      ),
     "base64"
   );
 }
@@ -123,7 +475,8 @@ function fromBase64url(value) {
 // ============================================================
 
 function createSessionToken() {
-  const secret = getSessionSecret();
+  const secret =
+    getSessionSecret();
 
   if (!secret) {
     throw new Error(
@@ -135,25 +488,34 @@ function createSessionToken() {
     Date.now().toString();
 
   const random =
-    crypto.randomBytes(32).toString("hex");
+    crypto
+      .randomBytes(32)
+      .toString("hex");
 
   const payload =
     `${timestamp}.${random}`;
 
   const signature =
     crypto
-      .createHmac("sha256", secret)
+      .createHmac(
+        "sha256",
+        secret
+      )
       .update(payload)
       .digest();
 
   return (
     `${base64url(
       Buffer.from(payload)
-    )}.${base64url(signature)}`
+    )}.${base64url(
+      signature
+    )}`
   );
 }
 
-function verifySessionToken(token) {
+function verifySessionToken(
+  token
+) {
   try {
     if (!token) {
       return false;
@@ -162,15 +524,21 @@ function verifySessionToken(token) {
     const parts =
       token.split(".");
 
-    if (parts.length !== 2) {
+    if (
+      parts.length !== 2
+    ) {
       return false;
     }
 
     const payload =
-      fromBase64url(parts[0]).toString();
+      fromBase64url(
+        parts[0]
+      ).toString();
 
     const suppliedSignature =
-      fromBase64url(parts[1]);
+      fromBase64url(
+        parts[1]
+      );
 
     const secret =
       getSessionSecret();
@@ -181,7 +549,10 @@ function verifySessionToken(token) {
 
     const expectedSignature =
       crypto
-        .createHmac("sha256", secret)
+        .createHmac(
+          "sha256",
+          secret
+        )
         .update(payload)
         .digest();
 
@@ -203,21 +574,29 @@ function verifySessionToken(token) {
 
     const [
       timestamp,
-    ] = payload.split(".");
+    ] =
+      payload.split(".");
 
     const createdAt =
       Number(timestamp);
 
-    if (!Number.isFinite(createdAt)) {
+    if (
+      !Number.isFinite(
+        createdAt
+      )
+    ) {
       return false;
     }
 
     const age =
-      Date.now() - createdAt;
+      Date.now() -
+      createdAt;
 
     if (
       age < 0 ||
-      age > SESSION_MAX_AGE * 1000
+      age >
+        SESSION_MAX_AGE *
+          1000
     ) {
       return false;
     }
@@ -237,22 +616,13 @@ async function isAdmin() {
       SESSION_COOKIE
     )?.value;
 
-  return verifySessionToken(token);
+  return verifySessionToken(
+    token
+  );
 }
 
 // ============================================================
 // DATABASE MIGRATION
-// ============================================================
-//
-// This makes the invite system backwards-compatible.
-//
-// Existing invites automatically receive:
-//   max_uses = 1
-//   use_count = 0
-//
-// New invites can specify any positive number
-// between MIN_INVITE_USES and MAX_INVITE_USES.
-//
 // ============================================================
 
 async function ensureInviteUsageColumns() {
@@ -265,13 +635,6 @@ async function ensureInviteUsageColumns() {
     ALTER TABLE invites
     ADD COLUMN IF NOT EXISTS use_count INTEGER NOT NULL DEFAULT 0
   `;
-
-  /*
-   * Protect the database from invalid values.
-   *
-   * The application validates values before insertion,
-   * but these constraints provide another layer of protection.
-   */
 
   await sql`
     UPDATE invites
@@ -287,14 +650,6 @@ async function ensureInviteUsageColumns() {
        OR use_count < 0
   `;
 
-  /*
-   * Existing invites that were already marked "used"
-   * should remain used.
-   *
-   * If an old invite has status "used" but no usage count,
-   * treat it as having consumed its one available use.
-   */
-
   await sql`
     UPDATE invites
     SET use_count = max_uses
@@ -307,7 +662,9 @@ async function ensureInviteUsageColumns() {
 // INVITE HELPERS
 // ============================================================
 
-function normalizeCode(code) {
+function normalizeCode(
+  code
+) {
   return String(code || "")
     .trim()
     .toUpperCase();
@@ -323,10 +680,15 @@ function generateInviteCode() {
 
     let output = "";
 
-    for (let i = 0; i < 4; i++) {
+    for (
+      let i = 0;
+      i < 4;
+      i++
+    ) {
       output +=
         alphabet[
-          bytes[i] % alphabet.length
+          bytes[i] %
+            alphabet.length
         ];
     }
 
@@ -342,7 +704,9 @@ function generateId() {
   return crypto.randomUUID();
 }
 
-function parseExpiration(value) {
+function parseExpiration(
+  value
+) {
   if (!value) {
     return null;
   }
@@ -361,13 +725,9 @@ function parseExpiration(value) {
   return date.toISOString();
 }
 
-function parseMaxUses(value) {
-  /*
-   * Do not silently turn invalid input into 1.
-   *
-   * This lets the API return a useful error instead.
-   */
-
+function parseMaxUses(
+  value
+) {
   if (
     value === undefined ||
     value === null ||
@@ -380,14 +740,18 @@ function parseMaxUses(value) {
     Number(value);
 
   if (
-    !Number.isInteger(number)
+    !Number.isInteger(
+      number
+    )
   ) {
     return null;
   }
 
   if (
-    number < MIN_INVITE_USES ||
-    number > MAX_INVITE_USES
+    number <
+      MIN_INVITE_USES ||
+    number >
+      MAX_INVITE_USES
   ) {
     return null;
   }
@@ -395,12 +759,18 @@ function parseMaxUses(value) {
   return number;
 }
 
-function getMaxUses(invite) {
+function getMaxUses(
+  invite
+) {
   const value =
-    Number(invite.max_uses);
+    Number(
+      invite.max_uses
+    );
 
   if (
-    !Number.isInteger(value) ||
+    !Number.isInteger(
+      value
+    ) ||
     value < 1
   ) {
     return 1;
@@ -409,12 +779,18 @@ function getMaxUses(invite) {
   return value;
 }
 
-function getUseCount(invite) {
+function getUseCount(
+  invite
+) {
   const value =
-    Number(invite.use_count);
+    Number(
+      invite.use_count
+    );
 
   if (
-    !Number.isInteger(value) ||
+    !Number.isInteger(
+      value
+    ) ||
     value < 0
   ) {
     return 0;
@@ -423,7 +799,9 @@ function getUseCount(invite) {
   return value;
 }
 
-function getRemainingUses(invite) {
+function getRemainingUses(
+  invite
+) {
   return Math.max(
     0,
     getMaxUses(invite) -
@@ -431,22 +809,15 @@ function getRemainingUses(invite) {
   );
 }
 
-function calculateStatus(invite) {
-  /*
-   * Revoked always wins.
-   */
-
+function calculateStatus(
+  invite
+) {
   if (
     invite.status ===
     "revoked"
   ) {
     return "revoked";
   }
-
-  /*
-   * An invite is considered used once
-   * every allowed redemption has been consumed.
-   */
 
   const maxUses =
     getMaxUses(invite);
@@ -455,21 +826,19 @@ function calculateStatus(invite) {
     getUseCount(invite);
 
   if (
-    invite.status === "used" ||
+    invite.status ===
+      "used" ||
     useCount >= maxUses
   ) {
     return "used";
   }
 
-  /*
-   * Expiration is checked before returning active.
-   */
-
   if (
     invite.expires_at &&
     new Date(
       invite.expires_at
-    ).getTime() <= Date.now()
+    ).getTime() <=
+      Date.now()
   ) {
     return "expired";
   }
@@ -481,14 +850,34 @@ function calculateStatus(invite) {
 // LOGIN
 // ============================================================
 
-async function handleLogin(request) {
+async function handleLogin(
+  request
+) {
+  const rateLimit =
+    applyRateLimit(
+      request,
+      "login"
+    );
+
+  if (
+    !rateLimit.allowed
+  ) {
+    return rateLimitResponse(
+      rateLimit
+    );
+  }
+
   const body =
     await request
       .json()
-      .catch(() => ({}));
+      .catch(
+        () => ({})
+      );
 
   const suppliedCode =
-    String(body.code || "");
+    String(
+      body.code || ""
+    );
 
   const configuredCode =
     getAdminCode();
@@ -505,10 +894,14 @@ async function handleLogin(request) {
   }
 
   const suppliedBuffer =
-    Buffer.from(suppliedCode);
+    Buffer.from(
+      suppliedCode
+    );
 
   const configuredBuffer =
-    Buffer.from(configuredCode);
+    Buffer.from(
+      configuredCode
+    );
 
   const validLength =
     suppliedBuffer.length ===
@@ -549,7 +942,8 @@ async function handleLogin(request) {
       secure:
         process.env.NODE_ENV ===
         "production",
-      sameSite: "strict",
+      sameSite:
+        "strict",
       path: "/",
       maxAge:
         SESSION_MAX_AGE,
@@ -577,7 +971,8 @@ async function handleLogout() {
       secure:
         process.env.NODE_ENV ===
         "production",
-      sameSite: "strict",
+      sameSite:
+        "strict",
       path: "/",
       maxAge: 0,
     }
@@ -592,7 +987,9 @@ async function handleLogout() {
 // SESSION
 // ============================================================
 
-async function handleSession() {
+async function handleSession(
+  request
+) {
   return json({
     authenticated:
       await isAdmin(),
@@ -610,7 +1007,8 @@ async function handleCreateInvite(
     return json(
       {
         success: false,
-        error: "Unauthorized.",
+        error:
+          "Unauthorized.",
       },
       401
     );
@@ -619,11 +1017,9 @@ async function handleCreateInvite(
   const body =
     await request
       .json()
-      .catch(() => ({}));
-
-  // ----------------------------------------------------------
-  // Expiration
-  // ----------------------------------------------------------
+      .catch(
+        () => ({})
+      );
 
   const requestedExpiration =
     parseExpiration(
@@ -648,7 +1044,8 @@ async function handleCreateInvite(
     requestedExpiration &&
     new Date(
       requestedExpiration
-    ).getTime() <= Date.now()
+    ).getTime() <=
+      Date.now()
   ) {
     return json(
       {
@@ -660,16 +1057,14 @@ async function handleCreateInvite(
     );
   }
 
-  // ----------------------------------------------------------
-  // Maximum uses
-  // ----------------------------------------------------------
-
   const maxUses =
     parseMaxUses(
       body.maxUses
     );
 
-  if (maxUses === null) {
+  if (
+    maxUses === null
+  ) {
     return json(
       {
         success: false,
@@ -679,10 +1074,6 @@ async function handleCreateInvite(
       400
     );
   }
-
-  // ----------------------------------------------------------
-  // Generate unique code
-  // ----------------------------------------------------------
 
   let code =
     generateInviteCode();
@@ -702,7 +1093,9 @@ async function handleCreateInvite(
         LIMIT 1
       `;
 
-    if (existing.length === 0) {
+    if (
+      existing.length === 0
+    ) {
       unique = true;
       break;
     }
@@ -721,10 +1114,6 @@ async function handleCreateInvite(
       500
     );
   }
-
-  // ----------------------------------------------------------
-  // Insert
-  // ----------------------------------------------------------
 
   const id =
     generateId();
@@ -753,7 +1142,8 @@ async function handleCreateInvite(
     invite: {
       id,
       code,
-      status: "active",
+      status:
+        "active",
       createdAt:
         new Date().toISOString(),
       expiresAt:
@@ -770,12 +1160,15 @@ async function handleCreateInvite(
 // LIST INVITES
 // ============================================================
 
-async function handleListInvites() {
+async function handleListInvites(
+  request
+) {
   if (!(await isAdmin())) {
     return json(
       {
         success: false,
-        error: "Unauthorized.",
+        error:
+          "Unauthorized.",
       },
       401
     );
@@ -798,47 +1191,57 @@ async function handleListInvites() {
     `;
 
   const invites =
-    result.map((invite) => {
-      const maxUses =
-        getMaxUses(invite);
+    result.map(
+      (invite) => {
+        const maxUses =
+          getMaxUses(
+            invite
+          );
 
-      const useCount =
-        getUseCount(invite);
+        const useCount =
+          getUseCount(
+            invite
+          );
 
-      const remainingUses =
-        Math.max(
-          0,
-          maxUses - useCount
-        );
+        const remainingUses =
+          Math.max(
+            0,
+            maxUses -
+              useCount
+          );
 
-      return {
-        id: invite.id,
+        return {
+          id:
+            invite.id,
 
-        code:
-          invite.code,
+          code:
+            invite.code,
 
-        status:
-          calculateStatus(invite),
+          status:
+            calculateStatus(
+              invite
+            ),
 
-        createdAt:
-          invite.created_at,
+          createdAt:
+            invite.created_at,
 
-        usedAt:
-          invite.used_at,
+          usedAt:
+            invite.used_at,
 
-        revokedAt:
-          invite.revoked_at,
+          revokedAt:
+            invite.revoked_at,
 
-        expiresAt:
-          invite.expires_at,
+          expiresAt:
+            invite.expires_at,
 
-        maxUses,
+          maxUses,
 
-        useCount,
+          useCount,
 
-        remainingUses,
-      };
-    });
+          remainingUses,
+        };
+      }
+    );
 
   return json({
     success: true,
@@ -849,29 +1252,52 @@ async function handleListInvites() {
 // ============================================================
 // VALIDATE INVITE
 // ============================================================
-//
-// PUBLIC ENDPOINT.
-//
-// This is used during signup before the user
-// has an administrator session.
-//
-// GET:
-// /api/admin?action=validate&code=FDS-XXXX-XXXX-XXXX
-//
-// ============================================================
 
 async function handleValidateInvite(
   request
 ) {
-  const { searchParams } =
-    new URL(request.url);
+  const rateLimit =
+    applyRateLimit(
+      request,
+      "validate"
+    );
+
+  if (
+    !rateLimit.allowed
+  ) {
+    return rateLimitResponse(
+      rateLimit
+    );
+  }
+
+  const {
+    searchParams,
+  } =
+    new URL(
+      request.url
+    );
 
   const code =
     normalizeCode(
-      searchParams.get("code")
+      searchParams.get(
+        "code"
+      )
     );
 
   if (!code) {
+    return json({
+      valid: false,
+    });
+  }
+
+  /*
+   * Prevent absurdly large inputs from being
+   * sent to the database.
+   */
+
+  if (
+    code.length > 64
+  ) {
     return json({
       valid: false,
     });
@@ -891,7 +1317,9 @@ async function handleValidateInvite(
       LIMIT 1
     `;
 
-  if (result.length === 0) {
+  if (
+    result.length === 0
+  ) {
     return json({
       valid: false,
     });
@@ -909,12 +1337,9 @@ async function handleValidateInvite(
   const remainingUses =
     Math.max(
       0,
-      maxUses - useCount
+      maxUses -
+        useCount
     );
-
-  // ----------------------------------------------------------
-  // Revoked
-  // ----------------------------------------------------------
 
   if (
     invite.status ===
@@ -925,12 +1350,9 @@ async function handleValidateInvite(
     });
   }
 
-  // ----------------------------------------------------------
-  // Fully consumed
-  // ----------------------------------------------------------
-
   if (
-    invite.status === "used" ||
+    invite.status ===
+      "used" ||
     remainingUses <= 0
   ) {
     return json({
@@ -938,15 +1360,12 @@ async function handleValidateInvite(
     });
   }
 
-  // ----------------------------------------------------------
-  // Expired
-  // ----------------------------------------------------------
-
   if (
     invite.expires_at &&
     new Date(
       invite.expires_at
-    ).getTime() <= Date.now()
+    ).getTime() <=
+      Date.now()
   ) {
     return json({
       valid: false,
@@ -956,10 +1375,15 @@ async function handleValidateInvite(
   return json({
     valid: true,
     invite: {
-      code: invite.code,
+      code:
+        invite.code,
+
       maxUses,
+
       useCount,
+
       remainingUses,
+
       expiresAt:
         invite.expires_at,
     },
@@ -969,42 +1393,30 @@ async function handleValidateInvite(
 // ============================================================
 // REDEEM INVITE
 // ============================================================
-//
-// Each successful redemption increments use_count by 1.
-//
-// Example:
-//
-// maxUses = 5
-//
-// Redemption 1:
-//   useCount = 1
-//   remaining = 4
-//   status = active
-//
-// Redemption 2:
-//   useCount = 2
-//   remaining = 3
-//   status = active
-//
-// ...
-//
-// Redemption 5:
-//   useCount = 5
-//   remaining = 0
-//   status = used
-//
-// The UPDATE is atomic, preventing two simultaneous
-// requests from consuming the same final use.
-//
-// ============================================================
 
 async function handleRedeemInvite(
   request
 ) {
+  const rateLimit =
+    applyRateLimit(
+      request,
+      "redeem"
+    );
+
+  if (
+    !rateLimit.allowed
+  ) {
+    return rateLimitResponse(
+      rateLimit
+    );
+  }
+
   const body =
     await request
       .json()
-      .catch(() => ({}));
+      .catch(
+        () => ({})
+      );
 
   const code =
     normalizeCode(
@@ -1022,35 +1434,42 @@ async function handleRedeemInvite(
     );
   }
 
-  /*
-   * Atomic redemption.
-   *
-   * The important condition is:
-   *
-   *   use_count < max_uses
-   *
-   * Because this happens inside the UPDATE,
-   * simultaneous requests cannot both consume
-   * the final available use.
-   */
+  if (
+    code.length > 64
+  ) {
+    return json(
+      {
+        success: false,
+        error:
+          "Invalid invite code.",
+      },
+      400
+    );
+  }
 
   const result =
     await sql`
       UPDATE invites
       SET
-        use_count = use_count + 1,
+        use_count =
+          use_count + 1,
 
-        status = CASE
-          WHEN use_count + 1 >= max_uses
-            THEN 'used'
-          ELSE 'active'
-        END,
+        status =
+          CASE
+            WHEN use_count + 1 >= max_uses
+              THEN 'used'
+            ELSE 'active'
+          END,
 
-        used_at = CASE
-          WHEN use_count + 1 >= max_uses
-            THEN COALESCE(used_at, NOW())
-          ELSE used_at
-        END
+        used_at =
+          CASE
+            WHEN use_count + 1 >= max_uses
+              THEN COALESCE(
+                used_at,
+                NOW()
+              )
+            ELSE used_at
+          END
 
       WHERE
         code = ${code}
@@ -1074,7 +1493,9 @@ async function handleRedeemInvite(
         use_count
     `;
 
-  if (result.length === 0) {
+  if (
+    result.length === 0
+  ) {
     return json(
       {
         success: false,
@@ -1097,7 +1518,8 @@ async function handleRedeemInvite(
   const remainingUses =
     Math.max(
       0,
-      maxUses - useCount
+      maxUses -
+        useCount
     );
 
   return json({
@@ -1111,7 +1533,9 @@ async function handleRedeemInvite(
         invite.code,
 
       status:
-        calculateStatus(invite),
+        calculateStatus(
+          invite
+        ),
 
       usedAt:
         invite.used_at,
@@ -1139,18 +1563,25 @@ async function handleRevokeInvite(
     return json(
       {
         success: false,
-        error: "Unauthorized.",
+        error:
+          "Unauthorized.",
       },
       401
     );
   }
 
-  const { searchParams } =
-    new URL(request.url);
+  const {
+    searchParams,
+  } =
+    new URL(
+      request.url
+    );
 
   const code =
     normalizeCode(
-      searchParams.get("code")
+      searchParams.get(
+        "code"
+      )
     );
 
   if (!code) {
@@ -1182,7 +1613,9 @@ async function handleRevokeInvite(
         use_count
     `;
 
-  if (result.length === 0) {
+  if (
+    result.length === 0
+  ) {
     return json(
       {
         success: false,
@@ -1213,13 +1646,19 @@ async function handleRevokeInvite(
         invite.revoked_at,
 
       maxUses:
-        getMaxUses(invite),
+        getMaxUses(
+          invite
+        ),
 
       useCount:
-        getUseCount(invite),
+        getUseCount(
+          invite
+        ),
 
       remainingUses:
-        getRemainingUses(invite),
+        getRemainingUses(
+          invite
+        ),
     },
   });
 }
@@ -1228,12 +1667,15 @@ async function handleRevokeInvite(
 // STATS
 // ============================================================
 
-async function handleStats() {
+async function handleStats(
+  request
+) {
   if (!(await isAdmin())) {
     return json(
       {
         success: false,
-        error: "Unauthorized.",
+        error:
+          "Unauthorized.",
       },
       401
     );
@@ -1261,7 +1703,8 @@ async function handleStats() {
         )::int AS used,
 
         COUNT(*) FILTER (
-          WHERE status = 'revoked'
+          WHERE
+            status = 'revoked'
         )::int AS revoked,
 
         COUNT(*) FILTER (
@@ -1293,19 +1736,29 @@ async function handleStats() {
 
     stats: {
       total:
-        Number(stats.total) || 0,
+        Number(
+          stats.total
+        ) || 0,
 
       active:
-        Number(stats.active) || 0,
+        Number(
+          stats.active
+        ) || 0,
 
       used:
-        Number(stats.used) || 0,
+        Number(
+          stats.used
+        ) || 0,
 
       revoked:
-        Number(stats.revoked) || 0,
+        Number(
+          stats.revoked
+        ) || 0,
 
       expired:
-        Number(stats.expired) || 0,
+        Number(
+          stats.expired
+        ) || 0,
 
       totalRedemptions:
         Number(
@@ -1343,40 +1796,96 @@ export async function GET(
   request
 ) {
   try {
+    /*
+     * Global protection applies to every GET request.
+     */
+
+    const globalRateLimit =
+      checkRateLimit(
+        request,
+        "global"
+      );
+
+    if (
+      !globalRateLimit.allowed
+    ) {
+      return applyCors(
+        rateLimitResponse(
+          globalRateLimit
+        ),
+        request
+      );
+    }
+
     await initializeDatabase();
 
-    /*
-     * Make sure multi-use columns exist
-     * before any invite operation runs.
-     */
     await ensureInviteUsageColumns();
 
-    const { searchParams } =
-      new URL(request.url);
+    const {
+      searchParams,
+    } =
+      new URL(
+        request.url
+      );
 
     const action =
-      searchParams.get("action") ||
-      "session";
+      searchParams.get(
+        "action"
+      ) || "session";
+
+    /*
+     * Action-specific protection.
+     */
+
+    let rateLimitType =
+      null;
+
+    if (
+      action ===
+      "validate"
+    ) {
+      rateLimitType =
+        "validate";
+    } else {
+      rateLimitType =
+        "admin";
+    }
+
+    const actionRateLimit =
+      checkRateLimit(
+        request,
+        rateLimitType
+      );
+
+    if (
+      !actionRateLimit.allowed
+    ) {
+      return applyCors(
+        rateLimitResponse(
+          actionRateLimit
+        ),
+        request
+      );
+    }
 
     let response;
 
     switch (action) {
       case "session":
         response =
-          await handleSession();
+          await handleSession(
+            request
+          );
         break;
 
       case "invites":
         response =
-          await handleListInvites();
+          await handleListInvites(
+            request
+          );
         break;
 
       case "validate":
-        /*
-         * PUBLIC ENDPOINT.
-         *
-         * Do NOT require an admin session.
-         */
         response =
           await handleValidateInvite(
             request
@@ -1385,7 +1894,9 @@ export async function GET(
 
       case "stats":
         response =
-          await handleStats();
+          await handleStats(
+            request
+          );
         break;
 
       default:
@@ -1417,6 +1928,7 @@ export async function GET(
           success: false,
           error:
             "Internal server error.",
+
           details:
             process.env.NODE_ENV !==
             "production"
@@ -1441,36 +1953,90 @@ export async function POST(
   request
 ) {
   try {
+    /*
+     * Global POST protection.
+     */
+
+    const globalRateLimit =
+      checkRateLimit(
+        request,
+        "global"
+      );
+
+    if (
+      !globalRateLimit.allowed
+    ) {
+      return applyCors(
+        rateLimitResponse(
+          globalRateLimit
+        ),
+        request
+      );
+    }
+
     await initializeDatabase();
 
-    /*
-     * Make sure multi-use columns exist
-     * before creating/redeeming invites.
-     */
     await ensureInviteUsageColumns();
 
     const url =
-      new URL(request.url);
+      new URL(
+        request.url
+      );
 
     let action =
       url.searchParams.get(
         "action"
       );
 
-    /*
-     * If action wasn't provided
-     * in the URL, look for it in
-     * the JSON body.
-     */
     if (!action) {
       const body =
         await request
           .clone()
           .json()
-          .catch(() => ({}));
+          .catch(
+            () => ({})
+          );
 
       action =
         body.action;
+    }
+
+    /*
+     * Action-specific rate limits.
+     */
+
+    let rateLimitType =
+      "admin";
+
+    if (
+      action === "login"
+    ) {
+      rateLimitType =
+        "login";
+    }
+
+    if (
+      action === "redeem"
+    ) {
+      rateLimitType =
+        "redeem";
+    }
+
+    const actionRateLimit =
+      checkRateLimit(
+        request,
+        rateLimitType
+      );
+
+    if (
+      !actionRateLimit.allowed
+    ) {
+      return applyCors(
+        rateLimitResponse(
+          actionRateLimit
+        ),
+        request
+      );
     }
 
     let response;
@@ -1531,6 +2097,7 @@ export async function POST(
           success: false,
           error:
             "Internal server error.",
+
           details:
             process.env.NODE_ENV !==
             "production"
@@ -1555,16 +2122,50 @@ export async function DELETE(
   request
 ) {
   try {
+    const globalRateLimit =
+      checkRateLimit(
+        request,
+        "global"
+      );
+
+    if (
+      !globalRateLimit.allowed
+    ) {
+      return applyCors(
+        rateLimitResponse(
+          globalRateLimit
+        ),
+        request
+      );
+    }
+
+    const adminRateLimit =
+      checkRateLimit(
+        request,
+        "admin"
+      );
+
+    if (
+      !adminRateLimit.allowed
+    ) {
+      return applyCors(
+        rateLimitResponse(
+          adminRateLimit
+        ),
+        request
+      );
+    }
+
     await initializeDatabase();
 
-    /*
-     * Make sure the invite schema is
-     * current before handling the request.
-     */
     await ensureInviteUsageColumns();
 
-    const { searchParams } =
-      new URL(request.url);
+    const {
+      searchParams,
+    } =
+      new URL(
+        request.url
+      );
 
     const action =
       searchParams.get(
@@ -1574,7 +2175,8 @@ export async function DELETE(
     let response;
 
     if (
-      action !== "revoke"
+      action !==
+      "revoke"
     ) {
       response =
         json(
@@ -1608,6 +2210,7 @@ export async function DELETE(
           success: false,
           error:
             "Internal server error.",
+
           details:
             process.env.NODE_ENV !==
             "production"
