@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useState } from "react";
 
 const API = "/api/admin";
-
 const LOGO_SRC = "/logo.png";
 
 function Logo({ size = 42 }) {
@@ -191,6 +190,78 @@ function formatDateOnly(date) {
   }
 }
 
+function getUses(invite) {
+  const value = Number(invite?.uses);
+
+  if (!Number.isFinite(value) || value < 0) {
+    return 0;
+  }
+
+  return value;
+}
+
+function getMaxUses(invite) {
+  if (
+    invite?.maxUses === null ||
+    invite?.maxUses === undefined
+  ) {
+    return null;
+  }
+
+  const value = Number(invite.maxUses);
+
+  if (!Number.isFinite(value) || value < 1) {
+    return null;
+  }
+
+  return value;
+}
+
+function getRemainingUses(invite) {
+  const apiValue = Number(
+    invite?.remainingUses
+  );
+
+  if (
+    Number.isFinite(apiValue) &&
+    apiValue >= 0
+  ) {
+    return apiValue;
+  }
+
+  const maxUses = getMaxUses(invite);
+
+  if (maxUses === null) {
+    return null;
+  }
+
+  return Math.max(
+    0,
+    maxUses - getUses(invite)
+  );
+}
+
+function formatUsage(invite) {
+  const uses = getUses(invite);
+  const maxUses = getMaxUses(invite);
+
+  if (maxUses === null) {
+    return `${uses} / ∞`;
+  }
+
+  return `${uses} / ${maxUses}`;
+}
+
+function formatRemaining(invite) {
+  const remaining = getRemainingUses(invite);
+
+  if (remaining === null) {
+    return "Unlimited";
+  }
+
+  return String(remaining);
+}
+
 export default function Home() {
   const [loading, setLoading] = useState(true);
   const [authenticated, setAuthenticated] =
@@ -231,13 +302,17 @@ export default function Home() {
   const [filter, setFilter] =
     useState("all");
 
-  const [toast, setToast] = useState("");
+  const [toast, setToast] =
+    useState("");
 
   const [newInvite, setNewInvite] =
     useState(null);
 
   const [expiration, setExpiration] =
     useState("");
+
+  const [maxUses, setMaxUses] =
+    useState("1");
 
   useEffect(() => {
     checkSession();
@@ -252,7 +327,10 @@ export default function Home() {
         }
       );
 
-      const data = await response.json();
+      const data =
+        await response.json().catch(
+          () => ({})
+        );
 
       if (data.authenticated) {
         setAuthenticated(true);
@@ -294,9 +372,15 @@ export default function Home() {
         }
       );
 
-      const data = await response.json();
+      const data =
+        await response.json().catch(
+          () => ({})
+        );
 
-      if (!response.ok || !data.success) {
+      if (
+        !response.ok ||
+        !data.success
+      ) {
         setLoginError(
           data.error ||
             "Unable to authenticate."
@@ -337,21 +421,23 @@ export default function Home() {
     setDashboardLoading(true);
 
     try {
-      const [inviteResponse, statsResponse] =
-        await Promise.all([
-          fetch(
-            `${API}?action=invites`,
-            {
-              cache: "no-store",
-            }
-          ),
-          fetch(
-            `${API}?action=stats`,
-            {
-              cache: "no-store",
-            }
-          ),
-        ]);
+      const [
+        inviteResponse,
+        statsResponse,
+      ] = await Promise.all([
+        fetch(
+          `${API}?action=invites`,
+          {
+            cache: "no-store",
+          }
+        ),
+        fetch(
+          `${API}?action=stats`,
+          {
+            cache: "no-store",
+          }
+        ),
+      ]);
 
       if (
         inviteResponse.status === 401 ||
@@ -362,14 +448,22 @@ export default function Home() {
       }
 
       const inviteData =
-        await inviteResponse.json();
+        await inviteResponse
+          .json()
+          .catch(() => ({}));
 
       const statsData =
-        await statsResponse.json();
+        await statsResponse
+          .json()
+          .catch(() => ({}));
 
       if (inviteData.success) {
         setInvites(
-          inviteData.invites || []
+          Array.isArray(
+            inviteData.invites
+          )
+            ? inviteData.invites
+            : []
         );
       }
 
@@ -414,7 +508,27 @@ export default function Home() {
           return;
         }
 
-        expiresAt = date.toISOString();
+        expiresAt =
+          date.toISOString();
+      }
+
+      const parsedMaxUses =
+        Number.parseInt(
+          maxUses,
+          10
+        );
+
+      if (
+        !Number.isInteger(
+          parsedMaxUses
+        ) ||
+        parsedMaxUses < 1 ||
+        parsedMaxUses > 1000000
+      ) {
+        showToast(
+          "Uses must be between 1 and 1,000,000."
+        );
+        return;
       }
 
       const response = await fetch(
@@ -428,20 +542,25 @@ export default function Home() {
           body: JSON.stringify({
             action: "create_invite",
             expiresAt,
+            maxUses: parsedMaxUses,
           }),
         }
       );
 
-      const data = await response.json();
+      const data =
+        await response
+          .json()
+          .catch(() => ({}));
 
-      if (
-        response.status === 401
-      ) {
+      if (response.status === 401) {
         setAuthenticated(false);
         return;
       }
 
-      if (!response.ok || !data.success) {
+      if (
+        !response.ok ||
+        !data.success
+      ) {
         showToast(
           data.error ||
             "Unable to create invite."
@@ -451,6 +570,7 @@ export default function Home() {
 
       setNewInvite(data.invite);
       setExpiration("");
+      setMaxUses("1");
 
       await loadDashboard();
     } catch {
@@ -463,9 +583,10 @@ export default function Home() {
   }
 
   async function revokeInvite(code) {
-    const confirmed = window.confirm(
-      `Revoke ${code}?\n\nThis invite will no longer be usable.`
-    );
+    const confirmed =
+      window.confirm(
+        `Revoke ${code}?\n\nThis invite will no longer be usable.`
+      );
 
     if (!confirmed) {
       return;
@@ -481,16 +602,20 @@ export default function Home() {
         }
       );
 
-      const data = await response.json();
+      const data =
+        await response
+          .json()
+          .catch(() => ({}));
 
-      if (
-        response.status === 401
-      ) {
+      if (response.status === 401) {
         setAuthenticated(false);
         return;
       }
 
-      if (!response.ok || !data.success) {
+      if (
+        !response.ok ||
+        !data.success
+      ) {
         showToast(
           data.error ||
             "Unable to revoke invite."
@@ -498,7 +623,9 @@ export default function Home() {
         return;
       }
 
-      showToast("Invite revoked.");
+      showToast(
+        "Invite revoked."
+      );
 
       await loadDashboard();
     } catch {
@@ -542,23 +669,32 @@ export default function Home() {
     const query =
       search.trim().toLowerCase();
 
-    return invites.filter((invite) => {
-      const matchesSearch =
-        !query ||
-        invite.code
-          .toLowerCase()
-          .includes(query);
+    return invites.filter(
+      (invite) => {
+        const code =
+          String(
+            invite?.code || ""
+          ).toLowerCase();
 
-      const matchesFilter =
-        filter === "all" ||
-        invite.status === filter;
+        const matchesSearch =
+          !query ||
+          code.includes(query);
 
-      return (
-        matchesSearch &&
-        matchesFilter
-      );
-    });
-  }, [invites, search, filter]);
+        const matchesFilter =
+          filter === "all" ||
+          invite.status === filter;
+
+        return (
+          matchesSearch &&
+          matchesFilter
+        );
+      }
+    );
+  }, [
+    invites,
+    search,
+    filter,
+  ]);
 
   if (loading) {
     return (
@@ -573,7 +709,9 @@ export default function Home() {
           Loading Fades Administration
         </span>
 
-        <style jsx global>{styles}</style>
+        <style jsx global>
+          {styles}
+        </style>
       </div>
     );
   }
@@ -663,7 +801,9 @@ export default function Home() {
           </div>
         </div>
 
-        <style jsx global>{styles}</style>
+        <style jsx global>
+          {styles}
+        </style>
       </main>
     );
   }
@@ -681,7 +821,9 @@ export default function Home() {
 
           <div>
             <strong>Fades</strong>
-            <span>Administration</span>
+            <span>
+              Administration
+            </span>
           </div>
         </a>
 
@@ -690,9 +832,12 @@ export default function Home() {
             type="button"
             className="header-button"
             onClick={loadDashboard}
-            disabled={dashboardLoading}
+            disabled={
+              dashboardLoading
+            }
           >
             <RefreshIcon />
+
             <span className="desktop-only">
               Refresh
             </span>
@@ -704,6 +849,7 @@ export default function Home() {
             onClick={logout}
           >
             <LogoutIcon />
+
             <span className="desktop-only">
               Sign out
             </span>
@@ -720,7 +866,10 @@ export default function Home() {
 
             <h1>
               Fades Mail
-              <span> access control.</span>
+              <span>
+                {" "}
+                access control.
+              </span>
             </h1>
 
             <p>
@@ -742,7 +891,9 @@ export default function Home() {
               Total
             </span>
 
-            <strong>{stats.total}</strong>
+            <strong>
+              {stats.total}
+            </strong>
 
             <span className="stat-description">
               All invitations
@@ -754,7 +905,9 @@ export default function Home() {
               Active
             </span>
 
-            <strong>{stats.active}</strong>
+            <strong>
+              {stats.active}
+            </strong>
 
             <span className="stat-description">
               Ready for signup
@@ -766,7 +919,9 @@ export default function Home() {
               Used
             </span>
 
-            <strong>{stats.used}</strong>
+            <strong>
+              {stats.used}
+            </strong>
 
             <span className="stat-description">
               Completed invites
@@ -778,7 +933,9 @@ export default function Home() {
               Revoked
             </span>
 
-            <strong>{stats.revoked}</strong>
+            <strong>
+              {stats.revoked}
+            </strong>
 
             <span className="stat-description">
               Disabled invites
@@ -801,12 +958,36 @@ export default function Home() {
             </h2>
 
             <p>
-              Generate a secure one-time
-              invitation for Fades Mail.
+              Generate a secure invitation
+              for Fades Mail registration.
             </p>
           </div>
 
           <div className="create-controls">
+            <div className="expiration-control">
+              <label htmlFor="max-uses">
+                Uses
+              </label>
+
+              <input
+                id="max-uses"
+                type="number"
+                min="1"
+                max="1000000"
+                value={maxUses}
+                onChange={(event) =>
+                  setMaxUses(
+                    event.target.value
+                  )
+                }
+                placeholder="1"
+              />
+
+              <span className="control-hint">
+                Accounts allowed
+              </span>
+            </div>
+
             <div className="expiration-control">
               <label htmlFor="expiration">
                 Expires
@@ -822,6 +1003,10 @@ export default function Home() {
                   )
                 }
               />
+
+              <span className="control-hint">
+                Blank = never
+              </span>
             </div>
 
             <button
@@ -864,6 +1049,7 @@ export default function Home() {
                   setNewInvite(null)
                 }
                 className="close-button"
+                aria-label="Close"
               >
                 ×
               </button>
@@ -890,6 +1076,38 @@ export default function Home() {
                   ? "Copied"
                   : "Copy"}
               </button>
+            </div>
+
+            <div className="new-invite-meta">
+              <div>
+                <span>Usage</span>
+
+                <strong>
+                  {formatUsage(
+                    newInvite
+                  )}
+                </strong>
+              </div>
+
+              <div>
+                <span>Remaining</span>
+
+                <strong>
+                  {formatRemaining(
+                    newInvite
+                  )}
+                </strong>
+              </div>
+
+              <div>
+                <span>Expires</span>
+
+                <strong>
+                  {formatDateOnly(
+                    newInvite.expiresAt
+                  )}
+                </strong>
+              </div>
             </div>
 
             <div className="signup-link">
@@ -967,22 +1185,24 @@ export default function Home() {
                 ["used", "Used"],
                 ["revoked", "Revoked"],
                 ["expired", "Expired"],
-              ].map(([value, label]) => (
-                <button
-                  type="button"
-                  key={value}
-                  className={
-                    filter === value
-                      ? "filter-active"
-                      : ""
-                  }
-                  onClick={() =>
-                    setFilter(value)
-                  }
-                >
-                  {label}
-                </button>
-              ))}
+              ].map(
+                ([value, label]) => (
+                  <button
+                    type="button"
+                    key={value}
+                    className={
+                      filter === value
+                        ? "filter-active"
+                        : ""
+                    }
+                    onClick={() =>
+                      setFilter(value)
+                    }
+                  >
+                    {label}
+                  </button>
+                )
+              )}
             </div>
           </div>
 
@@ -990,6 +1210,7 @@ export default function Home() {
             <div className="table-header">
               <span>INVITE CODE</span>
               <span>STATUS</span>
+              <span>USAGE</span>
               <span>CREATED</span>
               <span>EXPIRES</span>
               <span />
@@ -1057,6 +1278,25 @@ export default function Home() {
                       </span>
                     </div>
 
+                    <div className="usage-cell">
+                      <strong>
+                        {getUses(
+                          invite
+                        )}
+                      </strong>
+
+                      <span>
+                        /
+                        {getMaxUses(
+                          invite
+                        ) === null
+                          ? "∞"
+                          : getMaxUses(
+                              invite
+                            )}
+                      </span>
+                    </div>
+
                     <div className="date-cell">
                       {formatDate(
                         invite.createdAt
@@ -1110,6 +1350,8 @@ export default function Home() {
               The Fades Mail signup service
               can validate and redeem invites
               through this single API route.
+              Multi-use invitations are
+              tracked by usage count.
             </p>
           </div>
         </section>
@@ -1136,7 +1378,9 @@ export default function Home() {
         </a>
       </footer>
 
-      <style jsx global>{styles}</style>
+      <style jsx global>
+        {styles}
+      </style>
     </main>
   );
 }
@@ -1807,7 +2051,7 @@ a {
 
   display: flex;
   align-items: flex-end;
-  gap: 8px;
+  gap: 10px;
 }
 
 .expiration-control {
@@ -1829,6 +2073,8 @@ a {
 .expiration-control input {
   height: 41px;
 
+  min-width: 120px;
+
   padding: 0 10px;
 
   border: 1px solid var(--line);
@@ -1842,11 +2088,30 @@ a {
   font-size: 11px;
 }
 
+.expiration-control input:focus {
+  border-color: var(--line-hover);
+  background: rgba(255,255,255,.04);
+}
+
+.expiration-control input[type="number"] {
+  width: 110px;
+}
+
+.control-hint {
+  color: var(--subtle);
+
+  font-size: 8px;
+  line-height: 1.2;
+
+  white-space: nowrap;
+}
+
 .create-button {
   height: 41px;
 
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 8px;
 
   padding: 0 14px;
@@ -1861,6 +2126,8 @@ a {
   font-weight: 700;
 
   cursor: pointer;
+
+  white-space: nowrap;
 }
 
 .create-button:hover:not(:disabled) {
@@ -1870,6 +2137,11 @@ a {
 .create-button:disabled {
   opacity: .55;
   cursor: default;
+}
+
+.create-button .button-spinner {
+  border-color: rgba(0,0,0,.15);
+  border-top-color: #111;
 }
 
 /* ============================================================
@@ -1934,6 +2206,11 @@ a {
   cursor: pointer;
 }
 
+.close-button:hover {
+  background: rgba(255,255,255,.04);
+  color: var(--text);
+}
+
 .invite-created-code {
   display: flex;
   align-items: center;
@@ -1980,6 +2257,50 @@ a {
   font-weight: 600;
 
   cursor: pointer;
+}
+
+.invite-created-code button:hover,
+.signup-link button:hover {
+  border-color: var(--line-hover);
+  color: var(--text);
+  background: rgba(255,255,255,.05);
+}
+
+.new-invite-meta {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+
+  margin-top: 10px;
+}
+
+.new-invite-meta > div {
+  padding: 12px;
+
+  border: 1px solid var(--line);
+  border-radius: 9px;
+
+  background: rgba(255,255,255,.015);
+}
+
+.new-invite-meta span {
+  display: block;
+
+  margin-bottom: 5px;
+
+  color: var(--subtle);
+
+  font-size: 8px;
+  font-weight: 700;
+
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+.new-invite-meta strong {
+  color: var(--text);
+
+  font-size: 11px;
 }
 
 .signup-link {
@@ -2120,8 +2441,10 @@ a {
 .table-header,
 .invite-row {
   display: grid;
+
   grid-template-columns:
     minmax(220px, 1.5fr)
+    .7fr
     .7fr
     1fr
     1fr
@@ -2242,8 +2565,29 @@ a {
   color: #55555a;
 }
 
+.usage-cell {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
+
+  color: var(--subtle);
+
+  font-size: 10px;
+}
+
+.usage-cell strong {
+  color: var(--text);
+
+  font-size: 11px;
+}
+
+.usage-cell span {
+  color: var(--subtle);
+}
+
 .date-cell {
   color: var(--muted);
+
   font-size: 10px;
 }
 
@@ -2448,6 +2792,18 @@ a {
    RESPONSIVE
 ============================================================ */
 
+@media (max-width: 1100px) {
+  .create-panel {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .create-controls {
+    width: 100%;
+    margin-left: 66px;
+  }
+}
+
 @media (max-width: 900px) {
   .stats-grid {
     grid-template-columns: repeat(2, 1fr);
@@ -2458,14 +2814,21 @@ a {
     flex-direction: column;
   }
 
-  .create-panel {
-    align-items: flex-start;
-    flex-wrap: wrap;
+  .create-controls {
+    margin-left: 66px;
   }
 
-  .create-controls {
-    width: 100%;
-    margin-left: 66px;
+  .table-header,
+  .invite-row {
+    grid-template-columns:
+      minmax(180px, 1.5fr)
+      .7fr
+      .7fr
+      1fr
+      1fr
+      70px;
+
+    gap: 10px;
   }
 }
 
@@ -2506,6 +2869,7 @@ a {
 
   .invite-row {
     grid-template-columns: 1fr auto;
+
     gap: 12px;
 
     padding: 17px;
@@ -2513,7 +2877,8 @@ a {
 
   .invite-row > div:nth-child(2),
   .invite-row > div:nth-child(3),
-  .invite-row > div:nth-child(4) {
+  .invite-row > div:nth-child(4),
+  .invite-row > div:nth-child(5) {
     display: none;
   }
 
@@ -2529,6 +2894,10 @@ a {
 
   .create-controls {
     margin-left: 0;
+  }
+
+  .new-invite-meta {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -2567,13 +2936,19 @@ a {
 
   .create-controls {
     width: 100%;
+
     flex-direction: column;
     align-items: stretch;
   }
 
   .expiration-control input,
+  .expiration-control input[type="number"],
   .create-button {
     width: 100%;
+  }
+
+  .control-hint {
+    white-space: normal;
   }
 
   .invite-created-code {
