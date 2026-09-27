@@ -8,6 +8,64 @@ const SESSION_COOKIE = "fades_admin_session";
 const SESSION_MAX_AGE = 60 * 60 * 24 * 7; // 7 days
 
 // ============================================================
+// CORS
+// ============================================================
+
+const ALLOWED_ORIGINS = new Set([
+  "https://mail.fades.lol",
+  "https://www.mail.fades.lol",
+]);
+
+function applyCors(response, request) {
+  const origin = request.headers.get("origin");
+
+  const headers = new Headers(response.headers);
+
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    headers.set(
+      "Access-Control-Allow-Origin",
+      origin
+    );
+
+    headers.set(
+      "Access-Control-Allow-Credentials",
+      "true"
+    );
+
+    headers.set(
+      "Access-Control-Allow-Methods",
+      "GET, POST, DELETE, OPTIONS"
+    );
+
+    headers.set(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization"
+    );
+
+    headers.set(
+      "Access-Control-Max-Age",
+      "86400"
+    );
+
+    headers.set(
+      "Vary",
+      "Origin"
+    );
+  }
+
+  headers.set(
+    "Cache-Control",
+    "no-store"
+  );
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+// ============================================================
 // RESPONSE HELPERS
 // ============================================================
 
@@ -50,7 +108,9 @@ function base64url(buffer) {
 
 function fromBase64url(value) {
   return Buffer.from(
-    value.replace(/-/g, "+").replace(/_/g, "/"),
+    value
+      .replace(/-/g, "+")
+      .replace(/_/g, "/"),
     "base64"
   );
 }
@@ -68,22 +128,26 @@ function createSessionToken() {
     );
   }
 
-  const timestamp = Date.now().toString();
+  const timestamp =
+    Date.now().toString();
 
-  const random = crypto
-    .randomBytes(32)
-    .toString("hex");
+  const random =
+    crypto.randomBytes(32).toString("hex");
 
-  const payload = `${timestamp}.${random}`;
+  const payload =
+    `${timestamp}.${random}`;
 
-  const signature = crypto
-    .createHmac("sha256", secret)
-    .update(payload)
-    .digest();
+  const signature =
+    crypto
+      .createHmac("sha256", secret)
+      .update(payload)
+      .digest();
 
-  return `${base64url(
-    Buffer.from(payload)
-  )}.${base64url(signature)}`;
+  return (
+    `${base64url(
+      Buffer.from(payload)
+    )}.${base64url(signature)}`
+  );
 }
 
 function verifySessionToken(token) {
@@ -92,29 +156,31 @@ function verifySessionToken(token) {
       return false;
     }
 
-    const parts = token.split(".");
+    const parts =
+      token.split(".");
 
     if (parts.length !== 2) {
       return false;
     }
 
-    const payload = fromBase64url(
-      parts[0]
-    ).toString();
+    const payload =
+      fromBase64url(parts[0]).toString();
 
     const suppliedSignature =
       fromBase64url(parts[1]);
 
-    const secret = getSessionSecret();
+    const secret =
+      getSessionSecret();
 
     if (!secret) {
       return false;
     }
 
-    const expectedSignature = crypto
-      .createHmac("sha256", secret)
-      .update(payload)
-      .digest();
+    const expectedSignature =
+      crypto
+        .createHmac("sha256", secret)
+        .update(payload)
+        .digest();
 
     if (
       suppliedSignature.length !==
@@ -132,10 +198,12 @@ function verifySessionToken(token) {
       return false;
     }
 
-    const [timestamp] =
-      payload.split(".");
+    const [
+      timestamp,
+    ] = payload.split(".");
 
-    const createdAt = Number(timestamp);
+    const createdAt =
+      Number(timestamp);
 
     if (!Number.isFinite(createdAt)) {
       return false;
@@ -158,11 +226,13 @@ function verifySessionToken(token) {
 }
 
 async function isAdmin() {
-  const cookieStore = await cookies();
+  const cookieStore =
+    await cookies();
 
-  const token = cookieStore.get(
-    SESSION_COOKIE
-  )?.value;
+  const token =
+    cookieStore.get(
+      SESSION_COOKIE
+    )?.value;
 
   return verifySessionToken(token);
 }
@@ -182,7 +252,8 @@ function generateInviteCode() {
     "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
   const makePart = () => {
-    const bytes = crypto.randomBytes(4);
+    const bytes =
+      crypto.randomBytes(4);
 
     let output = "";
 
@@ -196,7 +267,9 @@ function generateInviteCode() {
     return output;
   };
 
-  return `FDS-${makePart()}-${makePart()}-${makePart()}`;
+  return (
+    `FDS-${makePart()}-${makePart()}-${makePart()}`
+  );
 }
 
 function generateId() {
@@ -208,9 +281,14 @@ function parseExpiration(value) {
     return null;
   }
 
-  const date = new Date(value);
+  const date =
+    new Date(value);
 
-  if (Number.isNaN(date.getTime())) {
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
     return null;
   }
 
@@ -218,18 +296,25 @@ function parseExpiration(value) {
 }
 
 function calculateStatus(invite) {
-  if (invite.status === "revoked") {
+  if (
+    invite.status ===
+    "revoked"
+  ) {
     return "revoked";
   }
 
-  if (invite.status === "used") {
+  if (
+    invite.status ===
+    "used"
+  ) {
     return "used";
   }
 
   if (
     invite.expires_at &&
-    new Date(invite.expires_at).getTime() <=
-      Date.now()
+    new Date(
+      invite.expires_at
+    ).getTime() <= Date.now()
   ) {
     return "expired";
   }
@@ -242,13 +327,13 @@ function calculateStatus(invite) {
 // ============================================================
 
 async function handleLogin(request) {
-  const body = await request
-    .json()
-    .catch(() => ({}));
+  const body =
+    await request
+      .json()
+      .catch(() => ({}));
 
-  const suppliedCode = String(
-    body.code || ""
-  );
+  const suppliedCode =
+    String(body.code || "");
 
   const configuredCode =
     getAdminCode();
@@ -277,10 +362,11 @@ async function handleLogin(request) {
   let valid = false;
 
   if (validLength) {
-    valid = crypto.timingSafeEqual(
-      suppliedBuffer,
-      configuredBuffer
-    );
+    valid =
+      crypto.timingSafeEqual(
+        suppliedBuffer,
+        configuredBuffer
+      );
   }
 
   if (!valid) {
@@ -310,7 +396,8 @@ async function handleLogin(request) {
         "production",
       sameSite: "strict",
       path: "/",
-      maxAge: SESSION_MAX_AGE,
+      maxAge:
+        SESSION_MAX_AGE,
     }
   );
 
@@ -374,9 +461,10 @@ async function handleCreateInvite(
     );
   }
 
-  const body = await request
-    .json()
-    .catch(() => ({}));
+  const body =
+    await request
+      .json()
+      .catch(() => ({}));
 
   const requestedExpiration =
     parseExpiration(
@@ -402,27 +490,39 @@ async function handleCreateInvite(
   let code =
     generateInviteCode();
 
-  // Make sure the generated code
-  // isn't already in the database.
+  let unique = false;
+
   for (
     let attempt = 0;
     attempt < 10;
     attempt++
   ) {
-    const existing = await sql`
-      SELECT id
-      FROM invites
-      WHERE code = ${code}
-      LIMIT 1
-    `;
+    const existing =
+      await sql`
+        SELECT id
+        FROM invites
+        WHERE code = ${code}
+        LIMIT 1
+      `;
 
-    // Neon returns an array directly.
     if (existing.length === 0) {
+      unique = true;
       break;
     }
 
     code =
       generateInviteCode();
+  }
+
+  if (!unique) {
+    return json(
+      {
+        success: false,
+        error:
+          "Unable to generate a unique invite code.",
+      },
+      500
+    );
   }
 
   const id =
@@ -470,20 +570,20 @@ async function handleListInvites() {
     );
   }
 
-  const result = await sql`
-    SELECT
-      id,
-      code,
-      status,
-      created_at,
-      used_at,
-      revoked_at,
-      expires_at
-    FROM invites
-    ORDER BY created_at DESC
-  `;
+  const result =
+    await sql`
+      SELECT
+        id,
+        code,
+        status,
+        created_at,
+        used_at,
+        revoked_at,
+        expires_at
+      FROM invites
+      ORDER BY created_at DESC
+    `;
 
-  // Neon returns the rows directly.
   const invites =
     result.map((invite) => ({
       id: invite.id,
@@ -509,6 +609,18 @@ async function handleListInvites() {
 // ============================================================
 // VALIDATE INVITE
 // ============================================================
+//
+// IMPORTANT:
+// This endpoint is intentionally PUBLIC.
+//
+// Users who are signing up do not have an
+// administrator session yet, so this endpoint
+// MUST NOT call isAdmin().
+//
+// GET:
+// /api/admin?action=validate&code=FDS-XXXX-XXXX-XXXX
+//
+// ============================================================
 
 async function handleValidateInvite(
   request
@@ -527,17 +639,17 @@ async function handleValidateInvite(
     });
   }
 
-  const result = await sql`
-    SELECT
-      code,
-      status,
-      expires_at
-    FROM invites
-    WHERE code = ${code}
-    LIMIT 1
-  `;
+  const result =
+    await sql`
+      SELECT
+        code,
+        status,
+        expires_at
+      FROM invites
+      WHERE code = ${code}
+      LIMIT 1
+    `;
 
-  // Neon returns an array.
   if (result.length === 0) {
     return json({
       valid: false,
@@ -579,12 +691,15 @@ async function handleValidateInvite(
 async function handleRedeemInvite(
   request
 ) {
-  const body = await request
-    .json()
-    .catch(() => ({}));
+  const body =
+    await request
+      .json()
+      .catch(() => ({}));
 
   const code =
-    normalizeCode(body.code);
+    normalizeCode(
+      body.code
+    );
 
   if (!code) {
     return json(
@@ -600,34 +715,34 @@ async function handleRedeemInvite(
   /*
    * Atomic redemption.
    *
-   * Only an active and non-expired
-   * invite can become used.
+   * Only an active, non-expired invite
+   * can become used.
    *
-   * This prevents two signup
-   * requests from consuming the
-   * same invite.
+   * This prevents two simultaneous
+   * requests from successfully
+   * consuming the same invite.
    */
 
-  const result = await sql`
-    UPDATE invites
-    SET
-      status = 'used',
-      used_at = NOW()
-    WHERE
-      code = ${code}
-      AND status = 'active'
-      AND (
-        expires_at IS NULL
-        OR expires_at > NOW()
-      )
-    RETURNING
-      id,
-      code,
-      status,
-      used_at
-  `;
+  const result =
+    await sql`
+      UPDATE invites
+      SET
+        status = 'used',
+        used_at = NOW()
+      WHERE
+        code = ${code}
+        AND status = 'active'
+        AND (
+          expires_at IS NULL
+          OR expires_at > NOW()
+        )
+      RETURNING
+        id,
+        code,
+        status,
+        used_at
+    `;
 
-  // Neon returns an array.
   if (result.length === 0) {
     return json(
       {
@@ -647,8 +762,10 @@ async function handleRedeemInvite(
     invite: {
       id: invite.id,
       code: invite.code,
-      status: invite.status,
-      usedAt: invite.used_at,
+      status:
+        invite.status,
+      usedAt:
+        invite.used_at,
     },
   });
 }
@@ -689,22 +806,22 @@ async function handleRevokeInvite(
     );
   }
 
-  const result = await sql`
-    UPDATE invites
-    SET
-      status = 'revoked',
-      revoked_at = NOW()
-    WHERE
-      code = ${code}
-      AND status = 'active'
-    RETURNING
-      id,
-      code,
-      status,
-      revoked_at
-  `;
+  const result =
+    await sql`
+      UPDATE invites
+      SET
+        status = 'revoked',
+        revoked_at = NOW()
+      WHERE
+        code = ${code}
+        AND status = 'active'
+      RETURNING
+        id,
+        code,
+        status,
+        revoked_at
+    `;
 
-  // Neon returns an array.
   if (result.length === 0) {
     return json(
       {
@@ -736,38 +853,38 @@ async function handleStats() {
     );
   }
 
-  const result = await sql`
-    SELECT
-      COUNT(*)::int AS total,
+  const result =
+    await sql`
+      SELECT
+        COUNT(*)::int AS total,
 
-      COUNT(*) FILTER (
-        WHERE
-          status = 'active'
-          AND (
-            expires_at IS NULL
-            OR expires_at > NOW()
-          )
-      )::int AS active,
+        COUNT(*) FILTER (
+          WHERE
+            status = 'active'
+            AND (
+              expires_at IS NULL
+              OR expires_at > NOW()
+            )
+        )::int AS active,
 
-      COUNT(*) FILTER (
-        WHERE status = 'used'
-      )::int AS used,
+        COUNT(*) FILTER (
+          WHERE status = 'used'
+        )::int AS used,
 
-      COUNT(*) FILTER (
-        WHERE status = 'revoked'
-      )::int AS revoked,
+        COUNT(*) FILTER (
+          WHERE status = 'revoked'
+        )::int AS revoked,
 
-      COUNT(*) FILTER (
-        WHERE
-          status = 'active'
-          AND expires_at IS NOT NULL
-          AND expires_at <= NOW()
-      )::int AS expired
+        COUNT(*) FILTER (
+          WHERE
+            status = 'active'
+            AND expires_at IS NOT NULL
+            AND expires_at <= NOW()
+        )::int AS expired
 
-    FROM invites
-  `;
+      FROM invites
+    `;
 
-  // Neon returns an array.
   const stats =
     result[0];
 
@@ -793,10 +910,27 @@ async function handleStats() {
 }
 
 // ============================================================
+// OPTIONS — CORS PREFLIGHT
+// ============================================================
+
+export async function OPTIONS(
+  request
+) {
+  return applyCors(
+    new Response(null, {
+      status: 204,
+    }),
+    request
+  );
+}
+
+// ============================================================
 // GET
 // ============================================================
 
-export async function GET(request) {
+export async function GET(
+  request
+) {
   try {
     await initializeDatabase();
 
@@ -807,52 +941,78 @@ export async function GET(request) {
       searchParams.get("action") ||
       "session";
 
+    let response;
+
     switch (action) {
       case "session":
-        return handleSession();
+        response =
+          await handleSession();
+        break;
 
       case "invites":
-        return handleListInvites();
+        response =
+          await handleListInvites();
+        break;
 
       case "validate":
-        return handleValidateInvite(
-          request
-        );
+        /*
+         * PUBLIC ENDPOINT
+         *
+         * Do NOT require an admin
+         * session here.
+         */
+        response =
+          await handleValidateInvite(
+            request
+          );
+        break;
 
       case "stats":
-        return handleStats();
+        response =
+          await handleStats();
+        break;
 
       default:
-        return json(
-          {
-            success: false,
-            error:
-              "Unknown action.",
-          },
-          400
-        );
+        response =
+          json(
+            {
+              success: false,
+              error:
+                "Unknown action.",
+            },
+            400
+          );
+        break;
     }
+
+    return applyCors(
+      response,
+      request
+    );
   } catch (error) {
     console.error(
       "Fades Admin GET error:",
       error
     );
 
-    return json(
-      {
-        success: false,
-        error:
-          "Internal server error.",
-        details:
-          process.env.NODE_ENV !==
-          "production"
-            ? String(
-                error?.message ||
-                  error
-              )
-            : undefined,
-      },
-      500
+    return applyCors(
+      json(
+        {
+          success: false,
+          error:
+            "Internal server error.",
+          details:
+            process.env.NODE_ENV !==
+            "production"
+              ? String(
+                  error?.message ||
+                    error
+                )
+              : undefined,
+        },
+        500
+      ),
+      request
     );
   }
 }
@@ -861,7 +1021,9 @@ export async function GET(request) {
 // POST
 // ============================================================
 
-export async function POST(request) {
+export async function POST(
+  request
+) {
   try {
     await initializeDatabase();
 
@@ -873,12 +1035,15 @@ export async function POST(request) {
         "action"
       );
 
+    /*
+     * If action wasn't provided
+     * in the URL, look for it in
+     * the JSON body.
+     */
     if (!action) {
-      const clone =
-        request.clone();
-
       const body =
-        await clone
+        await request
+          .clone()
           .json()
           .catch(() => ({}));
 
@@ -886,56 +1051,76 @@ export async function POST(request) {
         body.action;
     }
 
+    let response;
+
     switch (action) {
       case "login":
-        return handleLogin(
-          request
-        );
+        response =
+          await handleLogin(
+            request
+          );
+        break;
 
       case "logout":
-        return handleLogout();
+        response =
+          await handleLogout();
+        break;
 
       case "create_invite":
-        return handleCreateInvite(
-          request
-        );
+        response =
+          await handleCreateInvite(
+            request
+          );
+        break;
 
       case "redeem":
-        return handleRedeemInvite(
-          request
-        );
+        response =
+          await handleRedeemInvite(
+            request
+          );
+        break;
 
       default:
-        return json(
-          {
-            success: false,
-            error:
-              "Unknown action.",
-          },
-          400
-        );
+        response =
+          json(
+            {
+              success: false,
+              error:
+                "Unknown action.",
+            },
+            400
+          );
+        break;
     }
+
+    return applyCors(
+      response,
+      request
+    );
   } catch (error) {
     console.error(
       "Fades Admin POST error:",
       error
     );
 
-    return json(
-      {
-        success: false,
-        error:
-          "Internal server error.",
-        details:
-          process.env.NODE_ENV !==
-          "production"
-            ? String(
-                error?.message ||
-                  error
-              )
-            : undefined,
-      },
-      500
+    return applyCors(
+      json(
+        {
+          success: false,
+          error:
+            "Internal server error.",
+          details:
+            process.env.NODE_ENV !==
+            "production"
+              ? String(
+                  error?.message ||
+                    error
+                )
+              : undefined,
+        },
+        500
+      ),
+      request
     );
   }
 }
@@ -944,7 +1129,9 @@ export async function POST(request) {
 // DELETE
 // ============================================================
 
-export async function DELETE(request) {
+export async function DELETE(
+  request
+) {
   try {
     await initializeDatabase();
 
@@ -956,18 +1143,29 @@ export async function DELETE(request) {
         "action"
       );
 
-    if (action !== "revoke") {
-      return json(
-        {
-          success: false,
-          error:
-            "Unknown action.",
-        },
-        400
-      );
+    let response;
+
+    if (
+      action !== "revoke"
+    ) {
+      response =
+        json(
+          {
+            success: false,
+            error:
+              "Unknown action.",
+          },
+          400
+        );
+    } else {
+      response =
+        await handleRevokeInvite(
+          request
+        );
     }
 
-    return handleRevokeInvite(
+    return applyCors(
+      response,
       request
     );
   } catch (error) {
@@ -976,21 +1174,24 @@ export async function DELETE(request) {
       error
     );
 
-    return json(
-      {
-        success: false,
-        error:
-          "Internal server error.",
-        details:
-          process.env.NODE_ENV !==
-          "production"
-            ? String(
-                error?.message ||
-                  error
-              )
-            : undefined,
-      },
-      500
+    return applyCors(
+      json(
+        {
+          success: false,
+          error:
+            "Internal server error.",
+          details:
+            process.env.NODE_ENV !==
+            "production"
+              ? String(
+                  error?.message ||
+                    error
+                )
+              : undefined,
+        },
+        500
+      ),
+      request
     );
   }
 }
