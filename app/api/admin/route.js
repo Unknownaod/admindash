@@ -358,7 +358,7 @@ function applyCors(
 
     headers.set(
       "Access-Control-Allow-Headers",
-      "Content-Type, Authorization"
+      "Content-Type, Authorization, Accept, Cache-Control"
     );
 
     headers.set(
