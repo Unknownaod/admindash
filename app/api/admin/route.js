@@ -7,6 +7,9 @@ export const runtime = "nodejs";
 const SESSION_COOKIE = "fades_admin_session";
 const SESSION_MAX_AGE = 60 * 60 * 24 * 7; // 7 days
 
+const MIN_INVITE_USES = 1;
+const MAX_INVITE_USES = 100000;
+
 // ============================================================
 // CORS
 // ============================================================
@@ -238,6 +241,69 @@ async function isAdmin() {
 }
 
 // ============================================================
+// DATABASE MIGRATION
+// ============================================================
+//
+// This makes the invite system backwards-compatible.
+//
+// Existing invites automatically receive:
+//   max_uses = 1
+//   use_count = 0
+//
+// New invites can specify any positive number
+// between MIN_INVITE_USES and MAX_INVITE_USES.
+//
+// ============================================================
+
+async function ensureInviteUsageColumns() {
+  await sql`
+    ALTER TABLE invites
+    ADD COLUMN IF NOT EXISTS max_uses INTEGER NOT NULL DEFAULT 1
+  `;
+
+  await sql`
+    ALTER TABLE invites
+    ADD COLUMN IF NOT EXISTS use_count INTEGER NOT NULL DEFAULT 0
+  `;
+
+  /*
+   * Protect the database from invalid values.
+   *
+   * The application validates values before insertion,
+   * but these constraints provide another layer of protection.
+   */
+
+  await sql`
+    UPDATE invites
+    SET max_uses = 1
+    WHERE max_uses IS NULL
+       OR max_uses < 1
+  `;
+
+  await sql`
+    UPDATE invites
+    SET use_count = 0
+    WHERE use_count IS NULL
+       OR use_count < 0
+  `;
+
+  /*
+   * Existing invites that were already marked "used"
+   * should remain used.
+   *
+   * If an old invite has status "used" but no usage count,
+   * treat it as having consumed its one available use.
+   */
+
+  await sql`
+    UPDATE invites
+    SET use_count = max_uses
+    WHERE status = 'used'
+      AND use_count < max_uses
+  `;
+}
+
+// ============================================================
 // INVITE HELPERS
 // ============================================================
 
@@ -295,7 +361,81 @@ function parseExpiration(value) {
   return date.toISOString();
 }
 
+function parseMaxUses(value) {
+  /*
+   * Do not silently turn invalid input into 1.
+   *
+   * This lets the API return a useful error instead.
+   */
+
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return 1;
+  }
+
+  const number =
+    Number(value);
+
+  if (
+    !Number.isInteger(number)
+  ) {
+    return null;
+  }
+
+  if (
+    number < MIN_INVITE_USES ||
+    number > MAX_INVITE_USES
+  ) {
+    return null;
+  }
+
+  return number;
+}
+
+function getMaxUses(invite) {
+  const value =
+    Number(invite.max_uses);
+
+  if (
+    !Number.isInteger(value) ||
+    value < 1
+  ) {
+    return 1;
+  }
+
+  return value;
+}
+
+function getUseCount(invite) {
+  const value =
+    Number(invite.use_count);
+
+  if (
+    !Number.isInteger(value) ||
+    value < 0
+  ) {
+    return 0;
+  }
+
+  return value;
+}
+
+function getRemainingUses(invite) {
+  return Math.max(
+    0,
+    getMaxUses(invite) -
+      getUseCount(invite)
+  );
+}
+
 function calculateStatus(invite) {
+  /*
+   * Revoked always wins.
+   */
+
   if (
     invite.status ===
     "revoked"
@@ -303,12 +443,27 @@ function calculateStatus(invite) {
     return "revoked";
   }
 
+  /*
+   * An invite is considered used once
+   * every allowed redemption has been consumed.
+   */
+
+  const maxUses =
+    getMaxUses(invite);
+
+  const useCount =
+    getUseCount(invite);
+
   if (
-    invite.status ===
-    "used"
+    invite.status === "used" ||
+    useCount >= maxUses
   ) {
     return "used";
   }
+
+  /*
+   * Expiration is checked before returning active.
+   */
 
   if (
     invite.expires_at &&
@@ -466,10 +621,28 @@ async function handleCreateInvite(
       .json()
       .catch(() => ({}));
 
+  // ----------------------------------------------------------
+  // Expiration
+  // ----------------------------------------------------------
+
   const requestedExpiration =
     parseExpiration(
       body.expiresAt
     );
+
+  if (
+    body.expiresAt &&
+    !requestedExpiration
+  ) {
+    return json(
+      {
+        success: false,
+        error:
+          "Invalid expiration date.",
+      },
+      400
+    );
+  }
 
   if (
     requestedExpiration &&
@@ -486,6 +659,30 @@ async function handleCreateInvite(
       400
     );
   }
+
+  // ----------------------------------------------------------
+  // Maximum uses
+  // ----------------------------------------------------------
+
+  const maxUses =
+    parseMaxUses(
+      body.maxUses
+    );
+
+  if (maxUses === null) {
+    return json(
+      {
+        success: false,
+        error:
+          `maxUses must be a whole number between ${MIN_INVITE_USES} and ${MAX_INVITE_USES}.`,
+      },
+      400
+    );
+  }
+
+  // ----------------------------------------------------------
+  // Generate unique code
+  // ----------------------------------------------------------
 
   let code =
     generateInviteCode();
@@ -525,6 +722,10 @@ async function handleCreateInvite(
     );
   }
 
+  // ----------------------------------------------------------
+  // Insert
+  // ----------------------------------------------------------
+
   const id =
     generateId();
 
@@ -533,13 +734,17 @@ async function handleCreateInvite(
       id,
       code,
       status,
-      expires_at
+      expires_at,
+      max_uses,
+      use_count
     )
     VALUES (
       ${id},
       ${code},
       'active',
-      ${requestedExpiration}
+      ${requestedExpiration},
+      ${maxUses},
+      0
     )
   `;
 
@@ -549,8 +754,14 @@ async function handleCreateInvite(
       id,
       code,
       status: "active",
+      createdAt:
+        new Date().toISOString(),
       expiresAt:
         requestedExpiration,
+      maxUses,
+      useCount: 0,
+      remainingUses:
+        maxUses,
     },
   });
 }
@@ -579,26 +790,55 @@ async function handleListInvites() {
         created_at,
         used_at,
         revoked_at,
-        expires_at
+        expires_at,
+        max_uses,
+        use_count
       FROM invites
       ORDER BY created_at DESC
     `;
 
   const invites =
-    result.map((invite) => ({
-      id: invite.id,
-      code: invite.code,
-      status:
-        calculateStatus(invite),
-      createdAt:
-        invite.created_at,
-      usedAt:
-        invite.used_at,
-      revokedAt:
-        invite.revoked_at,
-      expiresAt:
-        invite.expires_at,
-    }));
+    result.map((invite) => {
+      const maxUses =
+        getMaxUses(invite);
+
+      const useCount =
+        getUseCount(invite);
+
+      const remainingUses =
+        Math.max(
+          0,
+          maxUses - useCount
+        );
+
+      return {
+        id: invite.id,
+
+        code:
+          invite.code,
+
+        status:
+          calculateStatus(invite),
+
+        createdAt:
+          invite.created_at,
+
+        usedAt:
+          invite.used_at,
+
+        revokedAt:
+          invite.revoked_at,
+
+        expiresAt:
+          invite.expires_at,
+
+        maxUses,
+
+        useCount,
+
+        remainingUses,
+      };
+    });
 
   return json({
     success: true,
@@ -610,12 +850,10 @@ async function handleListInvites() {
 // VALIDATE INVITE
 // ============================================================
 //
-// IMPORTANT:
-// This endpoint is intentionally PUBLIC.
+// PUBLIC ENDPOINT.
 //
-// Users who are signing up do not have an
-// administrator session yet, so this endpoint
-// MUST NOT call isAdmin().
+// This is used during signup before the user
+// has an administrator session.
 //
 // GET:
 // /api/admin?action=validate&code=FDS-XXXX-XXXX-XXXX
@@ -642,9 +880,12 @@ async function handleValidateInvite(
   const result =
     await sql`
       SELECT
+        id,
         code,
         status,
-        expires_at
+        expires_at,
+        max_uses,
+        use_count
       FROM invites
       WHERE code = ${code}
       LIMIT 1
@@ -659,14 +900,47 @@ async function handleValidateInvite(
   const invite =
     result[0];
 
+  const maxUses =
+    getMaxUses(invite);
+
+  const useCount =
+    getUseCount(invite);
+
+  const remainingUses =
+    Math.max(
+      0,
+      maxUses - useCount
+    );
+
+  // ----------------------------------------------------------
+  // Revoked
+  // ----------------------------------------------------------
+
   if (
-    invite.status !==
-    "active"
+    invite.status ===
+    "revoked"
   ) {
     return json({
       valid: false,
     });
   }
+
+  // ----------------------------------------------------------
+  // Fully consumed
+  // ----------------------------------------------------------
+
+  if (
+    invite.status === "used" ||
+    remainingUses <= 0
+  ) {
+    return json({
+      valid: false,
+    });
+  }
+
+  // ----------------------------------------------------------
+  // Expired
+  // ----------------------------------------------------------
 
   if (
     invite.expires_at &&
@@ -681,11 +955,47 @@ async function handleValidateInvite(
 
   return json({
     valid: true,
+    invite: {
+      code: invite.code,
+      maxUses,
+      useCount,
+      remainingUses,
+      expiresAt:
+        invite.expires_at,
+    },
   });
 }
 
 // ============================================================
 // REDEEM INVITE
+// ============================================================
+//
+// Each successful redemption increments use_count by 1.
+//
+// Example:
+//
+// maxUses = 5
+//
+// Redemption 1:
+//   useCount = 1
+//   remaining = 4
+//   status = active
+//
+// Redemption 2:
+//   useCount = 2
+//   remaining = 3
+//   status = active
+//
+// ...
+//
+// Redemption 5:
+//   useCount = 5
+//   remaining = 0
+//   status = used
+//
+// The UPDATE is atomic, preventing two simultaneous
+// requests from consuming the same final use.
+//
 // ============================================================
 
 async function handleRedeemInvite(
@@ -715,32 +1025,53 @@ async function handleRedeemInvite(
   /*
    * Atomic redemption.
    *
-   * Only an active, non-expired invite
-   * can become used.
+   * The important condition is:
    *
-   * This prevents two simultaneous
-   * requests from successfully
-   * consuming the same invite.
+   *   use_count < max_uses
+   *
+   * Because this happens inside the UPDATE,
+   * simultaneous requests cannot both consume
+   * the final available use.
    */
 
   const result =
     await sql`
       UPDATE invites
       SET
-        status = 'used',
-        used_at = NOW()
+        use_count = use_count + 1,
+
+        status = CASE
+          WHEN use_count + 1 >= max_uses
+            THEN 'used'
+          ELSE 'active'
+        END,
+
+        used_at = CASE
+          WHEN use_count + 1 >= max_uses
+            THEN COALESCE(used_at, NOW())
+          ELSE used_at
+        END
+
       WHERE
         code = ${code}
+
         AND status = 'active'
+
+        AND use_count < max_uses
+
         AND (
           expires_at IS NULL
           OR expires_at > NOW()
         )
+
       RETURNING
         id,
         code,
         status,
-        used_at
+        used_at,
+        expires_at,
+        max_uses,
+        use_count
     `;
 
   if (result.length === 0) {
@@ -748,7 +1079,7 @@ async function handleRedeemInvite(
       {
         success: false,
         error:
-          "Invite code is invalid, expired, revoked, or already used.",
+          "Invite code is invalid, expired, revoked, or has no remaining uses.",
       },
       400
     );
@@ -757,15 +1088,42 @@ async function handleRedeemInvite(
   const invite =
     result[0];
 
+  const maxUses =
+    getMaxUses(invite);
+
+  const useCount =
+    getUseCount(invite);
+
+  const remainingUses =
+    Math.max(
+      0,
+      maxUses - useCount
+    );
+
   return json({
     success: true,
+
     invite: {
-      id: invite.id,
-      code: invite.code,
+      id:
+        invite.id,
+
+      code:
+        invite.code,
+
       status:
-        invite.status,
+        calculateStatus(invite),
+
       usedAt:
         invite.used_at,
+
+      expiresAt:
+        invite.expires_at,
+
+      maxUses,
+
+      useCount,
+
+      remainingUses,
     },
   });
 }
@@ -819,7 +1177,9 @@ async function handleRevokeInvite(
         id,
         code,
         status,
-        revoked_at
+        revoked_at,
+        max_uses,
+        use_count
     `;
 
   if (result.length === 0) {
@@ -833,8 +1193,34 @@ async function handleRevokeInvite(
     );
   }
 
+  const invite =
+    result[0];
+
   return json({
     success: true,
+
+    invite: {
+      id:
+        invite.id,
+
+      code:
+        invite.code,
+
+      status:
+        "revoked",
+
+      revokedAt:
+        invite.revoked_at,
+
+      maxUses:
+        getMaxUses(invite),
+
+      useCount:
+        getUseCount(invite),
+
+      remainingUses:
+        getRemainingUses(invite),
+    },
   });
 }
 
@@ -861,6 +1247,7 @@ async function handleStats() {
         COUNT(*) FILTER (
           WHERE
             status = 'active'
+            AND use_count < max_uses
             AND (
               expires_at IS NULL
               OR expires_at > NOW()
@@ -868,7 +1255,9 @@ async function handleStats() {
         )::int AS active,
 
         COUNT(*) FILTER (
-          WHERE status = 'used'
+          WHERE
+            status = 'used'
+            OR use_count >= max_uses
         )::int AS used,
 
         COUNT(*) FILTER (
@@ -878,9 +1267,20 @@ async function handleStats() {
         COUNT(*) FILTER (
           WHERE
             status = 'active'
+            AND use_count < max_uses
             AND expires_at IS NOT NULL
             AND expires_at <= NOW()
-        )::int AS expired
+        )::int AS expired,
+
+        COALESCE(
+          SUM(use_count),
+          0
+        )::int AS total_redemptions,
+
+        COALESCE(
+          SUM(max_uses),
+          0
+        )::int AS total_available_uses
 
       FROM invites
     `;
@@ -890,6 +1290,7 @@ async function handleStats() {
 
   return json({
     success: true,
+
     stats: {
       total:
         Number(stats.total) || 0,
@@ -905,6 +1306,16 @@ async function handleStats() {
 
       expired:
         Number(stats.expired) || 0,
+
+      totalRedemptions:
+        Number(
+          stats.total_redemptions
+        ) || 0,
+
+      totalAvailableUses:
+        Number(
+          stats.total_available_uses
+        ) || 0,
     },
   });
 }
@@ -934,6 +1345,12 @@ export async function GET(
   try {
     await initializeDatabase();
 
+    /*
+     * Make sure multi-use columns exist
+     * before any invite operation runs.
+     */
+    await ensureInviteUsageColumns();
+
     const { searchParams } =
       new URL(request.url);
 
@@ -956,10 +1373,9 @@ export async function GET(
 
       case "validate":
         /*
-         * PUBLIC ENDPOINT
+         * PUBLIC ENDPOINT.
          *
-         * Do NOT require an admin
-         * session here.
+         * Do NOT require an admin session.
          */
         response =
           await handleValidateInvite(
@@ -1026,6 +1442,12 @@ export async function POST(
 ) {
   try {
     await initializeDatabase();
+
+    /*
+     * Make sure multi-use columns exist
+     * before creating/redeeming invites.
+     */
+    await ensureInviteUsageColumns();
 
     const url =
       new URL(request.url);
@@ -1134,6 +1556,12 @@ export async function DELETE(
 ) {
   try {
     await initializeDatabase();
+
+    /*
+     * Make sure the invite schema is
+     * current before handling the request.
+     */
+    await ensureInviteUsageColumns();
 
     const { searchParams } =
       new URL(request.url);
